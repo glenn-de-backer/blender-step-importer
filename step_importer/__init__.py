@@ -103,7 +103,6 @@ def prepare_meshes(payload, scene_scale):
 
     return prepared
 
-
 def create_objects(context, payload, source, use_normals):
     prepared = prepare_meshes(
         payload,
@@ -118,12 +117,31 @@ def create_objects(context, payload, source, use_normals):
         context.scene.collection.children.link(collection)
 
         for name, points, faces, normals in prepared:
+            # Find this body's bounding-box center in scene coordinates.
+            center = tuple(
+                (
+                    min(point[axis] for point in points)
+                    + max(point[axis] for point in points)
+                ) * 0.5
+                for axis in range(3)
+            )
+
+            # Store vertices relative to the new object origin.
+            local_points = [
+                tuple(
+                    point[axis] - center[axis]
+                    for axis in range(3)
+                )
+                for point in points
+            ]
+
             mesh = bpy.data.meshes.new(name)
             meshes.append(mesh)
 
-            mesh.from_pydata(points, [], faces)
+            mesh.from_pydata(local_points, [], faces)
             mesh.update()
 
+            # Translation doesn't change the surface normals.
             if use_normals:
                 for polygon in mesh.polygons:
                     polygon.use_smooth = True
@@ -132,11 +150,15 @@ def create_objects(context, payload, source, use_normals):
 
             obj = bpy.data.objects.new(name, mesh)
             objects.append(obj)
+
+            # Restore the assembly placement through the object transform.
+            # World position = local vertex position + object location.
+            obj.location = center
+
             collection.objects.link(obj)
             obj["step_source"] = str(source)
 
     except Exception:
-        # Roll back only the data created by this import.
         for obj in objects:
             bpy.data.objects.remove(obj, do_unlink=True)
 
@@ -155,7 +177,6 @@ def create_objects(context, payload, source, use_normals):
 
     context.view_layer.objects.active = objects[0]
     return len(objects)
-
 
 class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
     bl_idname = "import_scene.step_nvidia"

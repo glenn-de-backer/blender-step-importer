@@ -10,6 +10,7 @@ import usd_brep as sm
 
 
 def run_tool(command, env=None):
+    """Run a native converter and stop if it fails."""
     options = {}
 
     if os.name == "nt":
@@ -24,16 +25,61 @@ def run_tool(command, env=None):
     )
 
 
+def tessellate_body(usd_file, name, args):
+    """Convert one body's USD BReps into named mesh entries."""
+    breps = sm.usd.import_breps(str(usd_file), heal=False)
+
+    if not breps:
+        raise RuntimeError(f"No NVIDIA BRep imported for {name}.")
+
+    meshes = []
+
+    for index, brep in enumerate(breps, start=1):
+        mesh = sm.tessellate(
+            brep,
+            chord_height_tolerance=args.chord_mm,
+            curve_angle_tolerance_deg=args.angle_deg,
+            surface_angle_tolerance_deg=args.angle_deg,
+        )
+
+        arrays = mesh.to_mesh_arrays(face_varying_normals=True)
+
+        if not arrays["points"] or not arrays["faces"]:
+            raise RuntimeError(f"Body {name} produced an empty mesh.")
+
+        mesh_name = name
+
+        if len(breps) > 1:
+            mesh_name = f"{name} [{index}]"
+
+        meshes.append({
+            "name": mesh_name,
+            "points": arrays["points"],
+            "faces": arrays["faces"],
+            "normals": arrays["normals"],
+        })
+
+        print(
+            f"  {mesh_name}: "
+            f"{len(arrays['points'])} vertices, "
+            f"{len(arrays['face_normals'])} triangles",
+            flush=True,
+        )
+
+        # Finish using this mesh while its source BRep is still available.
+        del mesh
+
+    return meshes
+
+
 def convert(args):
     if os.name != "nt":
-        raise RuntimeError(
-            "This runtime package supports Windows x64."
-        )
+        raise RuntimeError("This runtime package supports Windows x64.")
 
     source = args.input.resolve(strict=True)
     output = args.output.resolve()
 
-    # Find bundled tools relative to this script.
+    # Discover all tools relative to the installed add-on.
     runtime = (
         Path(__file__).resolve().parent
         / "runtime"
@@ -52,24 +98,18 @@ def convert(args):
             )
 
     if source == output:
-        raise ValueError(
-            "Input and output paths must be different."
-        )
+        raise ValueError("Input and output paths must be different.")
 
     for value in (args.chord_mm, args.angle_deg):
         if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                "Tolerances must be finite and positive."
-            )
+            raise ValueError("Tolerances must be finite and positive.")
 
     if args.angle_deg > 180:
-        raise ValueError(
-            "Angular tolerance must not exceed 180 degrees."
-        )
+        raise ValueError("Angular tolerance must not exceed 180 degrees.")
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # These settings apply only to the NVIDIA converter.
+    # These settings apply only to the NVIDIA converter subprocess.
     environment = os.environ.copy()
     environment["OMNISOLID_PLUGIN_PATH"] = str(schema)
     environment["PXR_PLUGINPATH_NAME"] = str(nvidia / "plugin")
@@ -81,59 +121,63 @@ def convert(args):
 
     with tempfile.TemporaryDirectory(prefix="step_import_") as folder:
         folder = Path(folder)
-        brep_file = folder / "model.brep"
-        usd_file = folder / "model.usdc"
+        parts_folder = folder / "parts"
 
-        print("[1/3] Reading STEP...", flush=True)
-        run_tool([reader, source, brep_file])
+        print("[1/3] Reading named STEP bodies...", flush=True)
 
-        print(
-            "[2/3] Converting OCCT BRep to USD BRep...",
-            flush=True,
-        )
-        run_tool(
-            [converter, brep_file, usd_file],
-            env=environment,
-        )
+        # Split mode exports individual BReps and a name manifest.
+        run_tool([
+            reader,
+            "--split",
+            source,
+            parts_folder,
+        ])
 
-        print("[3/3] Tessellating with NVIDIA...", flush=True)
+        with (parts_folder / "manifest.json").open(
+            encoding="utf-8"
+        ) as file:
+            manifest = json.load(file)
 
-        breps = sm.usd.import_breps(str(usd_file), heal=False)
+        if manifest.get("version") != 2:
+            raise ValueError("Expected body manifest version 2.")
 
-        if not breps:
-            raise RuntimeError("No BReps were imported.")
+        if manifest.get("units") != "mm":
+            raise ValueError("Expected millimeter geometry.")
+
+        parts = manifest.get("parts", [])
+
+        if not parts:
+            raise RuntimeError("The STEP reader exported no bodies.")
+
+        print(f"STEP bodies: {len(parts)}", flush=True)
 
         meshes = []
 
-        for index, brep in enumerate(breps, 1):
-            mesh = sm.tessellate(
-                brep,
-                chord_height_tolerance=args.chord_mm,
-                curve_angle_tolerance_deg=args.angle_deg,
-                surface_angle_tolerance_deg=args.angle_deg,
-            )
+        for index, part in enumerate(parts, start=1):
+            brep_file = (
+                parts_folder / part["file"]
+            ).resolve(strict=True)
 
-            arrays = mesh.to_mesh_arrays(
-                face_varying_normals=True
-            )
+            if brep_file.parent != parts_folder.resolve():
+                raise ValueError("Invalid body path in manifest.")
 
-            if not arrays["points"] or not arrays["faces"]:
-                raise RuntimeError(
-                    f"BRep {index} produced an empty mesh."
-                )
-
-            meshes.append({
-                "name": f"{source.stem}_{index:03d}",
-                "points": arrays["points"],
-                "faces": arrays["faces"],
-                "normals": arrays["normals"],
-            })
+            name = part.get("name") or f"Body_{index:03d}"
+            usd_file = folder / f"body_{index:06d}.usdc"
 
             print(
-                f"  BRep {index}: "
-                f"{len(arrays['points'])} vertices, "
-                f"{len(arrays['face_normals'])} triangles",
+                f"[2/3] Converting body {index}/{len(parts)}: {name}",
                 flush=True,
+            )
+
+            run_tool(
+                [converter, brep_file, usd_file],
+                env=environment,
+            )
+
+            print(f"[3/3] Tessellating: {name}", flush=True)
+
+            meshes.extend(
+                tessellate_body(usd_file, name, args)
             )
 
         payload = json.dumps(
@@ -145,7 +189,7 @@ def convert(args):
             allow_nan=False,
         )
 
-        # Replace output only after successful conversion.
+        # Replace the output only after every body succeeds.
         pending = None
 
         try:
@@ -165,12 +209,13 @@ def convert(args):
             if pending is not None:
                 pending.unlink(missing_ok=True)
 
+    print(f"Completed: {len(meshes)} mesh objects", flush=True)
     print(f"Saved: {output}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert STEP to mesh JSON."
+        description="Convert named STEP bodies to mesh JSON."
     )
 
     parser.add_argument("input", type=Path)
