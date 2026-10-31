@@ -6,3 +6,5 @@ __pycache__/
 *.mesh.json
 build/
 dist/
+/step_importer/runtime/
+*.zip
