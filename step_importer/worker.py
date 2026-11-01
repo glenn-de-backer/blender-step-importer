@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import sys
 import shutil
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 # Write Unicode part names safely to the redirected worker log.
 for stream in (sys.stdout, sys.stderr):
@@ -15,6 +17,8 @@ for stream in (sys.stdout, sys.stderr):
             encoding="utf-8",
             errors="backslashreplace",
         )
+
+WORKER_VERSION = "1.0.14"
 
 import usd_brep as sm
 
@@ -48,6 +52,7 @@ def publish_progress(args, stage, message):
         "body_index": getattr(args, "_body_index", 0),
         "body_total": getattr(args, "_body_total", 0),
         "completed": getattr(args, "_completed", 0),
+        "active_workers": getattr(args, "_active_workers", 0),
         "body_name": getattr(args, "_body_name", ""),
     }
     try:
@@ -171,6 +176,8 @@ def tessellate_body(usd_file, name, args):
             del mesh  # Release while both source and repaired BReps remain alive.
             if not arrays["points"] or not arrays["faces"]:
                 raise RuntimeError(f"Body {name} produced an empty mesh.")
+        except (MemoryError, OSError):
+            raise
         except Exception as error:
             diagnostics = preserve_failure(
                 usd_file, name, index, args, error, initial, retry_report,
@@ -193,6 +200,178 @@ def tessellate_body(usd_file, name, args):
             flush=True,
         )
     return meshes
+
+
+def validate_mesh(item):
+    """Reject invalid body data before it enters the combined result."""
+    points, stream, normals = item["points"], item["faces"], item["normals"]
+    def vector_ok(vector):
+        return (len(vector) == 3 and all(
+            type(v) in (int, float) and math.isfinite(v) for v in vector))
+    if not points or not all(vector_ok(p) for p in points):
+        raise ValueError("Invalid mesh coordinates")
+    cursor = corners = 0
+    while cursor < len(stream):
+        count = stream[cursor]
+        if type(count) is not int or count < 3:
+            raise ValueError("Invalid polygon size")
+        end = cursor + count + 1
+        face = stream[cursor + 1:end]
+        if end > len(stream) or any(type(i) is not int or i < 0 or i >= len(points) for i in face):
+            raise ValueError("Invalid polygon indices")
+        if len(set(face)) != count:
+            raise ValueError("Repeated polygon vertices")
+        corners += count
+        cursor = end
+    if not corners or len(normals) != corners:
+        raise ValueError("Invalid corner-normal count")
+    if not all(vector_ok(n) and 1e-10 <= math.hypot(*n) < math.inf for n in normals):
+        raise ValueError("Invalid surface normals")
+    json.dumps(item, allow_nan=False)
+
+
+def best_effort_diagnostics(function):
+    """Diagnostic storage must not replace the conversion error."""
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except (OSError, ValueError, TypeError) as error:
+            print(f"WARNING: could not save diagnostics: {error}", flush=True)
+            return None
+    return wrapped
+
+preserve_failure = best_effort_diagnostics(preserve_failure)
+
+
+def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
+    """Run bounded isolated Python workers; return results in STEP order."""
+    count = len(parts)
+    results = [None] * count
+    args._body_total = count
+    args._completed = 0
+    print(f"Processing {count} bodies with {args.jobs} separate workers.", flush=True)
+
+    def one_body(index, part):
+        brep_file = (parts_folder / part["file"]).resolve(strict=True)
+        if brep_file.parent != parts_folder.resolve():
+            raise ValueError("Invalid body path in manifest.")
+        name = part.get("name") or f"Body_{index:03d}"
+        result_path = folder / f"result_{index:06d}.json"
+        log_path = output.parent / f"job_{index:06d}.log"
+        command = [
+            sys.executable, "-u", str(Path(__file__).resolve()),
+            str(brep_file), str(result_path), "--body-job", "--body-name", name,
+            "--chord-mm", str(args.chord_mm), "--angle-deg", str(args.angle_deg),
+            "--jobs", "1", "--skip-failed",
+        ]
+        if args.repair_failed:
+            command.append("--repair-failed")
+        if args.allow_non_manifold_repair:
+            command.append("--allow-non-manifold-repair")
+        options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        with log_path.open("w", encoding="utf-8") as log:
+            try:
+                result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                        check=False, timeout=1200, **options)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                return index, name, None, f"Worker failed: {error}", log_path
+        if result.returncode == 0:
+            try:
+                with result_path.open(encoding="utf-8") as file:
+                    data = json.load(file)
+                if data.get("units") != "mm" or not data.get("meshes"):
+                    raise ValueError("Body worker returned no mesh")
+                return index, name, data, None, log_path
+            except (OSError, ValueError) as error:
+                return index, name, None, f"Invalid body result: {error}", log_path
+        failures_path = result_path.with_suffix(".failures.json")
+        if failures_path.is_file():
+            try:
+                with failures_path.open(encoding="utf-8") as file:
+                    failures = json.load(file).get("failed_parts", [])
+                if failures:
+                    return index, name, None, failures[0].get("error", "Body failed"), log_path
+            except (OSError, ValueError):
+                pass
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
+        except OSError:
+            tail = ""
+        return index, name, None, f"Worker exit {result.returncode}: {tail}", log_path
+
+    # Submit only bounded work. A strict failure cannot leave 214 jobs queued.
+    pool = ThreadPoolExecutor(max_workers=args.jobs)
+    futures = {}
+    next_index = 1
+    last_completed = time.monotonic()
+    try:
+        while next_index <= count and len(futures) < args.jobs:
+            future = pool.submit(one_body, next_index, parts[next_index - 1])
+            futures[future] = next_index
+            next_index += 1
+        while futures:
+            # Keep the viewport alive while a large body occupies every worker.
+            done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+            if not done:
+                indices = ", ".join(str(i) for i in sorted(futures.values()))
+                idle_seconds = int(time.monotonic() - last_completed)
+                args._active_workers = len(futures)
+                publish_progress(
+                    args, "working",
+                    f"Working on bodies {indices} ({len(futures)} active); "
+                    f"last completion {idle_seconds // 60:02d}:{idle_seconds % 60:02d} ago",
+                )
+                continue
+            for future in done:
+                index = futures.pop(future)
+                try:
+                    part_index, name, data, error, log_path = future.result()
+                except Exception as error:
+                    # Missing paths or malformed manifest are fatal, not skips.
+                    raise RuntimeError(f"Body {index} setup failed: {error}") from error
+                if data is None and not args.skip_failed:
+                    raise RuntimeError(f"Body {part_index}/{count} ({name}) failed: {error}. Log: {log_path}")
+                if data is None:
+                    print(f"WARNING: skipped body {part_index}/{count}: {name}: {error}. Log: {log_path}", flush=True)
+                    # The failed child keeps the original BRep in its diagnostics
+                    # when conversion, tessellation and OCCT meshing all fail.
+                    diagnostics = None
+                    failures_path = (folder / f"result_{part_index:06d}.json").with_suffix(".failures.json")
+                    if failures_path.is_file():
+                        try:
+                            failures = json.loads(failures_path.read_text(encoding="utf-8"))["failed_parts"]
+                            diagnostics = failures[0].get("diagnostics")
+                        except (OSError, ValueError, KeyError, IndexError):
+                            pass
+                    results[part_index - 1] = ([], [{"part_index": part_index,
+                        "name": name, "error": error, "diagnostics": diagnostics,
+                        "worker_log": str(log_path)}])
+                else:
+                    meshes = data["meshes"]
+                    failures = data.get("failed_parts", [])
+                    for failure in failures:
+                        failure["part_index"] = part_index
+                    results[part_index - 1] = (meshes, failures)
+                    recovered = sum(bool(mesh.get("fallback")) for mesh in meshes)
+                    print(f"Body {part_index}/{count}: {name}: {len(meshes)} mesh(es), "
+                          f"{recovered} OCCT fallback(s). Log: {log_path}", flush=True)
+                args._completed += 1
+                last_completed = time.monotonic()
+                args._body_index = part_index
+                args._body_name = name
+                publish_progress(args, "processed", f"Processed: {name}")
+                if next_index <= count:
+                    pending = pool.submit(one_body, next_index, parts[next_index - 1])
+                    futures[pending] = next_index
+                    next_index += 1
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    meshes = []
+    failed_parts = []
+    for body_meshes, failures in results:
+        meshes.extend(body_meshes)
+        failed_parts.extend(failures)
+    return meshes, failed_parts
 
 
 def convert(args):
@@ -244,98 +423,155 @@ def convert(args):
 
     with tempfile.TemporaryDirectory(prefix="step_import_") as folder:
         folder = Path(folder)
-        parts_folder = folder / "parts"
+        if getattr(args, "body_job", False):
+            parts_folder = source.parent
+            parts = [{"file": source.name, "name": args.body_name or source.stem}]
+        else:
+            parts_folder = folder / "parts"
 
-        publish_progress(args, "reading", "Reading STEP and extracting named bodies...")
-        print("[1/3] Reading named STEP bodies...", flush=True)
+            publish_progress(args, "reading", "Reading STEP and extracting named bodies...")
+            print("[1/3] Reading named STEP bodies...", flush=True)
 
-        # Split mode exports individual BReps and a name manifest.
-        run_tool([
-            reader,
-            "--split",
-            source,
-            parts_folder,
-        ])
+            # Split mode exports individual BReps and a name manifest.
+            run_tool([
+                reader,
+                "--split",
+                source,
+                parts_folder,
+            ])
 
-        with (parts_folder / "manifest.json").open(
-            encoding="utf-8"
-        ) as file:
-            manifest = json.load(file)
+            with (parts_folder / "manifest.json").open(
+                encoding="utf-8"
+            ) as file:
+                manifest = json.load(file)
 
-        if manifest.get("version") != 2:
-            raise ValueError("Expected body manifest version 2.")
+            if manifest.get("version") != 2:
+                raise ValueError("Expected body manifest version 2.")
 
-        if manifest.get("units") != "mm":
-            raise ValueError("Expected millimeter geometry.")
+            if manifest.get("units") != "mm":
+                raise ValueError("Expected millimeter geometry.")
 
-        parts = manifest.get("parts", [])
+            parts = manifest.get("parts", [])
 
-        if not parts:
-            raise RuntimeError("The STEP reader exported no bodies.")
+            if not parts:
+                raise RuntimeError("The STEP reader exported no bodies.")
 
-        print(f"STEP bodies: {len(parts)}", flush=True)
+            print(f"STEP bodies: {len(parts)}", flush=True)
 
-        meshes = []
-        failed_parts = []
-        args._body_total = len(parts)
-        args._completed = 0
+        if not getattr(args, "body_job", False) and getattr(args, "jobs", 1) > 1:
+            meshes, failed_parts = convert_parts_parallel(
+                args, parts, parts_folder, folder, reader, output)
+        else:
+            meshes = []
+            failed_parts = []
+            args._body_total = len(parts)
+            args._completed = 0
 
-        for index, part in enumerate(parts, start=1):
-            brep_file = (
-                parts_folder / part["file"]
-            ).resolve(strict=True)
+            for index, part in enumerate(parts, start=1):
+                brep_file = (
+                    parts_folder / part["file"]
+                ).resolve(strict=True)
 
-            if brep_file.parent != parts_folder.resolve():
-                raise ValueError("Invalid body path in manifest.")
+                if brep_file.parent != parts_folder.resolve():
+                    raise ValueError("Invalid body path in manifest.")
 
-            name = part.get("name") or f"Body_{index:03d}"
-            usd_file = folder / f"body_{index:06d}.usdc"
-            args._body_index = index
-            args._body_name = name
-            publish_progress(args, "converting", f"Converting: {name}")
+                name = part.get("name") or f"Body_{index:03d}"
+                usd_file = folder / f"body_{index:06d}.usdc"
+                args._body_index = index
+                args._body_name = name
+                publish_progress(args, "converting", f"Converting: {name}")
 
-            print(
-                f"[2/3] Converting body {index}/{len(parts)}: {name}",
-                flush=True,
-            )
-
-            try:
-                run_tool(
-                    [converter, brep_file, usd_file],
-                    env=environment,
-                )
-                publish_progress(args, "tessellating", f"Tessellating: {name}")
-                print(f"[3/3] Tessellating: {name}", flush=True)
-                meshes.extend(tessellate_body(usd_file, name, args))
-            except (RuntimeError, subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired) as error:
-                if not getattr(args, "skip_failed", False):
-                    raise
-                # Keep source geometry for skipped parts, even though this
-                # import may succeed and remove its normal temporary files.
-                diagnostics = Path(tempfile.mkdtemp(prefix="step_skipped_part_"))
-                shutil.copy2(brep_file, diagnostics / "source.brep")
-                if usd_file.is_file():
-                    shutil.copy2(usd_file, diagnostics / "converted.usdc")
-                failure = {
-                    "part_index": index,
-                    "name": name,
-                    "error": str(error),
-                    "diagnostics": str(diagnostics),
-                }
-                (diagnostics / "report.json").write_text(
-                    json.dumps(failure, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                failed_parts.append(failure)
                 print(
-                    f"WARNING: skipped body {index}/{len(parts)}: {name}. "
-                    f"Diagnostics: {diagnostics}", flush=True,
+                    f"[2/3] Converting body {index}/{len(parts)}: {name}",
+                    flush=True,
                 )
-                publish_progress(args, "skipped", f"Skipped: {name}")
 
-            args._completed = index
-            publish_progress(args, "processed", f"Processed: {name}")
+                try:
+                    run_tool(
+                        [converter, brep_file, usd_file],
+                        env=environment,
+                    )
+                    publish_progress(args, "tessellating", f"Tessellating: {name}")
+                    print(f"[3/3] Tessellating: {name}", flush=True)
+                    body_meshes = tessellate_body(usd_file, name, args)
+                    if not body_meshes:
+                        raise ValueError("Body produced no meshes")
+                    for item in body_meshes:
+                        validate_mesh(item)
+                    meshes.extend(body_meshes)
+                except (RuntimeError, ValueError, TypeError, subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired) as error:
+                    # Recover from either USD conversion or NVIDIA tessellation
+                    # failure using the original OCCT BRep, never the healed USD.
+                    original_error = str(error)
+                    fallback_file = folder / f"occt_{index:06d}.mesh.json"
+                    publish_progress(args, "fallback", f"OCCT meshing: {name}")
+                    print(f"Trying OCCT fallback: {name}", flush=True)
+                    try:
+                        run_tool([reader, "--mesh", brep_file, fallback_file,
+                                  str(args.chord_mm), str(args.angle_deg)])
+                        with fallback_file.open(encoding="utf-8") as file:
+                            fallback = json.load(file)
+                        if (fallback.get("version") != 1 or fallback.get("units") != "mm"
+                                or fallback.get("mesher") != "occt"
+                                or fallback.get("missing_faces") != 0
+                                or fallback.get("status_flags") != 0
+                                or not fallback.get("face_count")):
+                            raise ValueError("OCCT returned an incomplete or incompatible mesh")
+                        item = {
+                            "name": name, "points": fallback["points"],
+                            "faces": fallback["faces"], "normals": fallback["normals"],
+                            "repair": None,
+                            "fallback": {
+                                "mesher": "occt", "nvidia_error": original_error,
+                                "chord_mm": fallback.get("chord_mm"),
+                                "angle_deg": fallback.get("angle_deg"),
+                                "face_count": fallback["face_count"],
+                                "degenerate_triangles_skipped": fallback.get("degenerate_triangles_skipped", 0),
+                                "normals": "flat triangle normals",
+                                "nurbs_face_count": fallback.get("nurbs_face_count", 0),
+                                "original_status_flags": fallback.get("original_status_flags", 0),
+                                "seam_continuity_verified": False,
+                            },
+                        }
+                        validate_mesh(item)
+                        meshes.append(item)
+                        args._completed = index
+                        publish_progress(args, "processed", f"Imported with OCCT: {name}")
+                        print(f"OCCT fallback succeeded: {name}", flush=True)
+                        continue
+                    except (RuntimeError, ValueError, TypeError, KeyError,
+                            subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                        FileNotFoundError) as fallback_error:
+                        error = RuntimeError(
+                            f"{name}: NVIDIA failed: {original_error}; "
+                            f"OCCT fallback failed: {fallback_error}")
+                    if not getattr(args, "skip_failed", False):
+                        raise error
+                    # Keep source geometry for skipped parts, even though this
+                    # import may succeed and remove its normal temporary files.
+                    failure = {"part_index": index, "name": name,
+                               "error": str(error), "diagnostics": None}
+                    try:
+                        diagnostics = Path(tempfile.mkdtemp(prefix="step_skipped_part_"))
+                        failure["diagnostics"] = str(diagnostics)
+                        shutil.copy2(brep_file, diagnostics / "source.brep")
+                        if usd_file.is_file():
+                            shutil.copy2(usd_file, diagnostics / "converted.usdc")
+                        (diagnostics / "report.json").write_text(
+                            json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except OSError as diagnostic_error:
+                        print(f"WARNING: could not save skipped-body diagnostics: {diagnostic_error}", flush=True)
+                    diagnostics = failure["diagnostics"] or "unavailable"
+                    failed_parts.append(failure)
+                    print(
+                        f"WARNING: skipped body {index}/{len(parts)}: {name}. "
+                        f"Diagnostics: {diagnostics}", flush=True,
+                    )
+                    publish_progress(args, "skipped", f"Skipped: {name}")
+
+                args._completed = index
+                publish_progress(args, "processed", f"Processed: {name}")
 
         if not meshes:
             failures_file = output.with_suffix(".failures.json")
@@ -412,10 +648,21 @@ def main():
         help="Continue after body conversion failures and report every skipped body.",
     )
     parser.add_argument("--progress-file", type=Path, help="Live status JSON for Blender.")
+    parser.add_argument("--jobs", type=int, default=4,
+                        help="Concurrent isolated body workers (1 to 8).")
+    parser.add_argument("--body-job", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--body-name", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not 1 <= args.jobs <= 8:
+        parser.error("--jobs must be between 1 and 8")
+    print(f"STEP worker {WORKER_VERSION}: {Path(__file__).resolve()}", flush=True)
+    print(f"Options: repair={args.repair_failed}, allow_non_manifold={args.allow_non_manifold_repair}, skip={args.skip_failed}, jobs={args.jobs}", flush=True)
     try:
         convert(args)
-    except Exception:
+    except Exception as error:
+        packet = {"version": WORKER_VERSION, "status": "failed",
+                  "message": str(error), "error_type": type(error).__name__}
+        print("STEP_RESULT " + json.dumps(packet, ensure_ascii=False), flush=True)
         publish_progress(args, "failed", "Conversion failed; see worker log")
         raise
 

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "STEP Importer — NVIDIA USD BRep",
     "author": "STEP Importer contributors",
-    "version": (1, 0, 4),
+    "version": (1, 0, 14),
     "blender": (5, 2, 0),
     "location": "File > Import",
     "description": "Import STEP using Open CASCADE and NVIDIA USD BRep",
@@ -19,11 +19,69 @@ import time
 
 import bpy
 import blf
-from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 
 active_import = None
+viewport_notice = None
+notice_draw_handle = None
+notice_timer_running = False
+
+
+def mesh_tolerances(quality, chord_mm, angle_deg):
+    """Translate a simple quality choice into the worker's CAD tolerances."""
+    presets = {
+        "DRAFT": (2.0, 60.0),
+        "VERY_LOW": (1.0, 45.0),
+        "LOW": (0.3, 30.0),
+        "MEDIUM": (0.1, 15.0),
+        "HIGH": (0.02, 10.0),
+    }
+    return presets.get(quality, (chord_mm, angle_deg))
+
+
+def redraw_viewports():
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+def clear_viewport_notice():
+    global viewport_notice, notice_draw_handle
+    viewport_notice = None
+    if notice_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(notice_draw_handle, "WINDOW")
+        notice_draw_handle = None
+    redraw_viewports()
+
+
+def expire_viewport_notice():
+    global notice_timer_running
+    if viewport_notice is None:
+        notice_timer_running = False
+        return None
+    remaining = viewport_notice["until"] - time.monotonic()
+    if remaining > 0:
+        return max(0.1, remaining)
+    clear_viewport_notice()
+    notice_timer_running = False
+    return None
+
+
+def show_viewport_notice(*lines, seconds=20.0):
+    """Show the import result in the 3D view after the modal job ends."""
+    global viewport_notice, notice_draw_handle, notice_timer_running
+    viewport_notice = {"lines": lines, "until": time.monotonic() + seconds}
+    if notice_draw_handle is None:
+        notice_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            draw_import_progress, (), "WINDOW", "POST_PIXEL",
+        )
+    if not notice_timer_running:
+        notice_timer_running = True
+        bpy.app.timers.register(expire_viewport_notice, first_interval=seconds)
+    redraw_viewports()
 
 
 def prepare_meshes(payload, scene_scale):
@@ -165,6 +223,7 @@ def create_objects_iter(context, payload, source, use_normals):
             collection.objects.link(obj)
             obj["step_source"] = str(source)
             repair = item.get("repair")
+            obj["step_mesher"] = "OCCT" if item.get("fallback") else "NVIDIA"
             obj["step_repaired"] = bool(repair)
             if repair:
                 obj["step_faces_before_repair"] = repair["faces_before"]
@@ -180,7 +239,9 @@ def create_objects_iter(context, payload, source, use_normals):
 
         repaired = [item for item in payload["meshes"] if item.get("repair")]
         skipped = payload.get("failed_parts", [])
-        if repaired or skipped:
+        fallback = [{"name": item["name"], **item["fallback"]}
+                    for item in payload["meshes"] if item.get("fallback")]
+        if repaired or skipped or fallback:
             report_text = bpy.data.texts.new("STEP Import Report")
             report_text.write(
                 "STEP IMPORT REPORT\n"
@@ -189,6 +250,7 @@ def create_objects_iter(context, payload, source, use_normals):
                 f"Skipped source bodies: {len(skipped)}\n"
                 f"Repaired mesh objects: {len(repaired)}\n\n"
                 "Skipped bodies are absent from the imported model.\n"
+                "OCCT fallback: seam continuity is not verified. Check recovered NURBS faces visually.\n"
                 "Repair modifies CAD topology. Successful tessellation and mesh "
                 "manifold checks do not establish full CAD validity.\n\n"
                 + json.dumps(
@@ -198,6 +260,7 @@ def create_objects_iter(context, payload, source, use_normals):
                             for item in repaired
                         ],
                         "skipped": skipped,
+                        "occt_fallback": fallback,
                     },
                     indent=2, ensure_ascii=False, default=str,
                 )
@@ -242,17 +305,22 @@ def create_objects(context, payload, source, use_normals):
 
 
 def draw_import_progress():
-    """Draw in every 3D viewport while an import is active."""
+    """Draw import progress or a brief result at the lower left of the view."""
     job = active_import
     region = bpy.context.region
-    if job is None or region is None:
+    if region is None:
         return
-    elapsed = int(time.monotonic() - job._started)
-    lines = (
-        "STEP Import",
-        job._progress_message,
-        f"Elapsed {elapsed // 60:02d}:{elapsed % 60:02d} | Esc to cancel",
-    )
+    if job is not None:
+        elapsed = int(time.monotonic() - job._started)
+        lines = (
+            "STEP Import",
+            job._progress_message,
+            f"Elapsed {elapsed // 60:02d}:{elapsed % 60:02d} | Esc to cancel",
+        )
+    elif viewport_notice is not None:
+        lines = viewport_notice["lines"]
+    else:
+        return
     font = 0
     blf.size(font, 16)
     blf.color(font, 1.0, 1.0, 1.0, 1.0)
@@ -261,7 +329,7 @@ def draw_import_progress():
     blf.shadow_offset(font, 1, -1)
     try:
         for index, line in enumerate(lines):
-            blf.position(font, 24, region.height - 100 - index * 24, 0)
+            blf.position(font, 24, 36 + (len(lines) - 1 - index) * 24, 0)
             blf.draw(font, line[:120])
     finally:
         blf.disable(font, blf.SHADOW)
@@ -277,6 +345,20 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(
         default="*.step;*.stp;*.STEP;*.STP",
         options={"HIDDEN"},
+    )
+
+    quality: EnumProperty(
+        name="Mesh quality",
+        description="Lower tolerance makes a denser mesh and takes more time",
+        items=(
+            ("DRAFT", "Draft", "Very coarse preview: 2.0 mm chord, 60 degree angle"),
+            ("VERY_LOW", "Very Low", "Coarse preview: 1.0 mm chord, 45 degree angle"),
+            ("LOW", "Low", "Faster preview: 0.3 mm chord, 30 degree angle"),
+            ("MEDIUM", "Medium", "Balanced: 0.1 mm chord, 15 degree angle"),
+            ("HIGH", "High", "Finer detail: 0.02 mm chord, 10 degree angle"),
+            ("CUSTOM", "Custom", "Set chord and angle tolerances manually"),
+        ),
+        default="MEDIUM",
     )
 
     chord_mm: FloatProperty(
@@ -305,7 +387,7 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
             "Repair can change features; full CAD validity is not established. "
             "Repaired objects and an import report are marked"
         ),
-        default=False,
+        default=True,
     )
 
     allow_non_manifold_repair: BoolProperty(
@@ -315,7 +397,7 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
             "inspection. Check the result before using operations that require "
             "manifold solids. Faces that fail tessellation are still rejected"
         ),
-        default=False,
+        default=True,
     )
 
     skip_failed: BoolProperty(
@@ -325,7 +407,15 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
             "tessellation. Skipped geometry is absent; names and errors are "
             "saved in STEP Import Report"
         ),
-        default=False,
+        default=True,
+    )
+
+    parallel_bodies: IntProperty(
+        name="Parallel bodies",
+        description="Number of isolated conversion workers (more uses more memory)",
+        default=4,
+        min=1,
+        max=8,
     )
 
     _process = None
@@ -341,12 +431,27 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
     _payload = None
     _phase = "worker"
 
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "quality")
+        if self.quality == "CUSTOM":
+            layout.prop(self, "chord_mm")
+            layout.prop(self, "angle_deg")
+        layout.prop(self, "parallel_bodies")
+        layout.prop(self, "use_normals")
+        layout.prop(self, "repair_failed")
+        if self.repair_failed:
+            layout.prop(self, "allow_non_manifold_repair")
+        layout.prop(self, "skip_failed")
+
     @classmethod
     def poll(cls, context):
         return context.mode == "OBJECT" and active_import is None
 
     def execute(self, context):
         global active_import
+
+        clear_viewport_notice()
 
         if os.name != "nt":
             self.report(
@@ -406,15 +511,19 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
                 encoding="utf-8",
             )
 
+            chord_mm, angle_deg = mesh_tolerances(
+                self.quality, self.chord_mm, self.angle_deg,
+            )
             command = [
                 str(python),
                 "-u",
                 str(worker),
                 str(self._source),
                 str(self._output),
-                "--chord-mm", str(self.chord_mm),
-                "--angle-deg", str(self.angle_deg),
+                "--chord-mm", str(chord_mm),
+                "--angle-deg", str(angle_deg),
                 "--progress-file", str(self._progress_path),
+                "--jobs", str(self.parallel_bodies),
             ]
 
             if self.repair_failed:
@@ -470,10 +579,6 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
             self.update_progress(self._progress_message, 0)
             self._wm.modal_handler_add(self)
 
-            self.report(
-                {"INFO"},
-                "Converting STEP; press Esc to cancel.",
-            )
             return {"RUNNING_MODAL"}
 
         except Exception as error:
@@ -521,27 +626,29 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
             for item in self._payload["meshes"]
         )
         skipped = len(self._payload.get("failed_parts", []))
+        fallback_count = sum(bool(item.get("fallback")) for item in self._payload["meshes"])
         self.cleanup()
-        if skipped or repaired:
-            self.report(
-                {"WARNING"},
-                f"Imported {count} objects; skipped {skipped}, repaired {repaired} "
-                f"({non_manifold} non-manifold). See STEP Import Report in Text Editor.",
+        if skipped or repaired or fallback_count:
+            show_viewport_notice(
+                f"STEP import complete: {count} objects",
+                f"OCCT fallback: {fallback_count} | Skipped: {skipped} | Repaired: {repaired} "
+                f"({non_manifold} non-manifold)",
+                "Details: Text Editor > STEP Import Report",
             )
         else:
-            self.report({"INFO"}, f"Imported {count} mesh object(s).")
+            show_viewport_notice(f"STEP import complete: {count} mesh object(s)")
         return {"FINISHED"}
 
     def modal(self, context, event):
         if event.type == "ESC":
             self.cleanup()
-            self.report({"INFO"}, "STEP import cancelled.")
+            show_viewport_notice("STEP import cancelled")
             return {"CANCELLED"}
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         if time.monotonic() - self._started > 1800:
             log_path = self.cleanup(keep_log=True)
-            self.report({"ERROR"}, f"Import timed out. Log: {log_path}")
+            show_viewport_notice("STEP import timed out", f"Log: {log_path}")
             return {"CANCELLED"}
 
         try:
@@ -592,13 +699,23 @@ class IMPORT_OT_step_nvidia(bpy.types.Operator, ImportHelper):
                     encoding="utf-8", errors="replace",
                 )[-6000:]
                 print("STEP worker error:\n" + tail)
-                raise RuntimeError(f"Worker exited with code {status}")
+                message = f"Worker exited with code {status}"
+                for line in reversed(tail.splitlines()):
+                    if line.startswith("STEP_RESULT "):
+                        try:
+                            packet = json.loads(line[len("STEP_RESULT "):])
+                            message = packet.get("message") or message
+                        except (ValueError, AttributeError):
+                            pass
+                        break
+                raise RuntimeError(message)
             self._phase = "loading"
             self.update_progress("Loading converted mesh data...")
             return {"RUNNING_MODAL"}
         except Exception as error:
             log_path = self.cleanup(keep_log=True)
-            self.report({"ERROR"}, f"{error}. Log: {log_path}")
+            print(f"STEP import failed: {error}. Log: {log_path}")
+            show_viewport_notice("STEP import failed", str(error), f"Log: {log_path}")
             return {"CANCELLED"}
 
     def cleanup(self, keep_log=False):
@@ -686,6 +803,7 @@ def register():
 def unregister():
     if active_import is not None:
         active_import.cleanup()
+    clear_viewport_notice()
 
     bpy.types.TOPBAR_MT_file_import.remove(import_menu)
     bpy.utils.unregister_class(IMPORT_OT_step_nvidia)
