@@ -18,7 +18,7 @@ for stream in (sys.stdout, sys.stderr):
             errors="backslashreplace",
         )
 
-WORKER_VERSION = "1.0.14"
+WORKER_VERSION = "1.3.0"
 
 import usd_brep as sm
 
@@ -243,12 +243,117 @@ def best_effort_diagnostics(function):
 preserve_failure = best_effort_diagnostics(preserve_failure)
 
 
+def body_chord_mm(args, part):
+    """Size-aware chord tolerance with a cap for rounded details."""
+    if not getattr(args, "adaptive", False):
+        return args.chord_mm
+    percent = getattr(args, "adaptive_percent", 0.1)
+    minimum = getattr(args, "adaptive_min_chord_mm", 0.02)
+    maximum = getattr(args, "adaptive_max_chord_mm", 0.1)
+    if (not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+                for v in (percent, minimum, maximum)) or minimum > maximum):
+        raise ValueError("Invalid adaptive detail settings: minimum must not exceed maximum.")
+    diagonal = part.get("diagonal_mm")
+    if (type(diagonal) not in (int, float) or not math.isfinite(diagonal)
+            or diagonal <= 0):
+        raise ValueError(
+            "Adaptive needs diagonal_mm for each body; update step-to-brep "
+            "to 1.2.0 and rebuild the bundled STEP reader."
+        )
+    return min(maximum, max(minimum, diagonal * percent / 100.0))
+
+
+def validate_assembly_manifest(manifest):
+    """Accept the old flat format and a preorder tree of assembly occurrences."""
+    version = manifest.get("version")
+    if version not in (2, 3):
+        raise ValueError("Expected body manifest version 2 or 3.")
+    assemblies = manifest.get("assemblies", []) if version == 3 else []
+    if not isinstance(assemblies, list):
+        raise ValueError("Invalid assembly list.")
+    known = {0}
+    for node in assemblies:
+        if not isinstance(node, dict):
+            raise ValueError("Invalid assembly node.")
+        node_id, parent_id = node.get("id"), node.get("parent_id")
+        if (type(node_id) is not int or node_id <= 0 or node_id in known
+                or type(parent_id) is not int or parent_id not in known
+                or not isinstance(node.get("name"), str) or not node["name"]):
+            raise ValueError("Invalid assembly hierarchy or name.")
+        known.add(node_id)
+    for part in manifest.get("parts", []):
+        if type(part.get("assembly_id", 0)) is not int or part.get("assembly_id", 0) not in known:
+            raise ValueError("Part references an unknown assembly.")
+    return assemblies
+
+
+def occt_fallback_attempts(chord_mm, angle_deg):
+    """Explore both directions relative to this body's requested tolerance."""
+    return [
+        (chord_mm, angle_deg, None),
+        (chord_mm * 3.0, min(180.0, angle_deg * 2.0), "coarser"),
+        (chord_mm * 0.5, angle_deg * 0.75, "finer"),
+    ]
+
+
+def mesh_with_occt_retry(reader, brep_file, fallback_file, name,
+                         nvidia_error, chord_mm, angle_deg):
+    """Only accept a complete validated mesh; record the successful tolerance."""
+    errors = []
+    for trial_chord, trial_angle, direction in occt_fallback_attempts(chord_mm, angle_deg):
+        try:
+            # An earlier failed converter could have left a partial JSON file.
+            fallback_file.unlink(missing_ok=True)
+            if direction:
+                print(f"Retrying OCCT with {direction} tolerance: {name} "
+                      f"({trial_chord:g} mm, {trial_angle:g} degrees)", flush=True)
+            run_tool([reader, "--mesh", brep_file, fallback_file,
+                      str(trial_chord), str(trial_angle)])
+            with fallback_file.open(encoding="utf-8") as file:
+                fallback = json.load(file)
+            if (fallback.get("version") != 1 or fallback.get("units") != "mm"
+                    or fallback.get("mesher") != "occt"
+                    or fallback.get("missing_faces") != 0
+                    or fallback.get("status_flags") != 0
+                    or not fallback.get("face_count")):
+                raise ValueError("OCCT returned an incomplete or incompatible mesh")
+            item = {
+                "name": name, "points": fallback["points"],
+                "faces": fallback["faces"], "normals": fallback["normals"],
+                "repair": None,
+                "fallback": {
+                    "mesher": "occt", "nvidia_error": nvidia_error,
+                    "chord_mm": fallback.get("chord_mm"),
+                    "angle_deg": fallback.get("angle_deg"),
+                    "requested_chord_mm": chord_mm,
+                    "requested_angle_deg": angle_deg,
+                    "retry_direction": direction,
+                    "coarser_retry": direction == "coarser",
+                    "finer_retry": direction == "finer",
+                    "face_count": fallback["face_count"],
+                    "degenerate_triangles_skipped": fallback.get("degenerate_triangles_skipped", 0),
+                    "normals": "flat triangle normals",
+                    "nurbs_face_count": fallback.get("nurbs_face_count", 0),
+                    "original_status_flags": fallback.get("original_status_flags", 0),
+                    "seam_continuity_verified": False,
+                },
+            }
+            validate_mesh(item)
+            return item
+        except (RuntimeError, ValueError, TypeError, KeyError, OSError,
+                subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{trial_chord:g} mm/{trial_angle:g} degrees: {error}")
+    raise RuntimeError("; ".join(errors))
+
+
 def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
     """Run bounded isolated Python workers; return results in STEP order."""
     count = len(parts)
     results = [None] * count
     args._body_total = count
     args._completed = 0
+    args._phase_seconds = {"usd_conversion": 0.0, "nvidia_tessellation": 0.0,
+                           "occt_fallback": 0.0}
     print(f"Processing {count} bodies with {args.jobs} separate workers.", flush=True)
 
     def one_body(index, part):
@@ -256,12 +361,13 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
         if brep_file.parent != parts_folder.resolve():
             raise ValueError("Invalid body path in manifest.")
         name = part.get("name") or f"Body_{index:03d}"
+        chord = body_chord_mm(args, part)
         result_path = folder / f"result_{index:06d}.json"
         log_path = output.parent / f"job_{index:06d}.log"
         command = [
             sys.executable, "-u", str(Path(__file__).resolve()),
             str(brep_file), str(result_path), "--body-job", "--body-name", name,
-            "--chord-mm", str(args.chord_mm), "--angle-deg", str(args.angle_deg),
+            "--chord-mm", str(chord), "--angle-deg", str(args.angle_deg),
             "--jobs", "1", "--skip-failed",
         ]
         if args.repair_failed:
@@ -344,13 +450,19 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
                         except (OSError, ValueError, KeyError, IndexError):
                             pass
                     results[part_index - 1] = ([], [{"part_index": part_index,
-                        "name": name, "error": error, "diagnostics": diagnostics,
+                        "name": name, "assembly_id": parts[part_index - 1].get("assembly_id", 0),
+                        "error": error, "diagnostics": diagnostics,
                         "worker_log": str(log_path)}])
                 else:
                     meshes = data["meshes"]
+                    for item in meshes:
+                        item["assembly_id"] = parts[part_index - 1].get("assembly_id", 0)
+                    for phase in args._phase_seconds:
+                        args._phase_seconds[phase] += data.get("phase_seconds", {}).get(phase, 0.0)
                     failures = data.get("failed_parts", [])
                     for failure in failures:
                         failure["part_index"] = part_index
+                        failure["assembly_id"] = parts[part_index - 1].get("assembly_id", 0)
                     results[part_index - 1] = (meshes, failures)
                     recovered = sum(bool(mesh.get("fallback")) for mesh in meshes)
                     print(f"Body {part_index}/{count}: {name}: {len(meshes)} mesh(es), "
@@ -375,6 +487,10 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
 
 
 def convert(args):
+    started = time.perf_counter()
+    phase_seconds = {"usd_conversion": 0.0, "nvidia_tessellation": 0.0,
+                     "occt_fallback": 0.0}
+    split_seconds = 0.0
     if os.name != "nt":
         raise RuntimeError("This runtime package supports Windows x64.")
 
@@ -433,20 +549,25 @@ def convert(args):
             print("[1/3] Reading named STEP bodies...", flush=True)
 
             # Split mode exports individual BReps and a name manifest.
+            split_started = time.perf_counter()
             run_tool([
                 reader,
                 "--split",
                 source,
                 parts_folder,
             ])
+            split_seconds = time.perf_counter() - split_started
 
             with (parts_folder / "manifest.json").open(
                 encoding="utf-8"
             ) as file:
                 manifest = json.load(file)
 
-            if manifest.get("version") != 2:
-                raise ValueError("Expected body manifest version 2.")
+            assemblies = validate_assembly_manifest(manifest)
+            if manifest["version"] == 2:
+                print("WARNING: STEP reader returned flat manifest v2; "
+                      "install step-to-brep 1.3.0 to preserve assembly hierarchy.",
+                      flush=True)
 
             if manifest.get("units") != "mm":
                 raise ValueError("Expected millimeter geometry.")
@@ -456,11 +577,18 @@ def convert(args):
             if not parts:
                 raise RuntimeError("The STEP reader exported no bodies.")
 
+            if getattr(args, "adaptive", False):
+                # Fail before launching workers when the bundled reader is old.
+                for part in parts:
+                    body_chord_mm(args, part)
+
             print(f"STEP bodies: {len(parts)}", flush=True)
 
+        processing_started = time.perf_counter()
         if not getattr(args, "body_job", False) and getattr(args, "jobs", 1) > 1:
             meshes, failed_parts = convert_parts_parallel(
                 args, parts, parts_folder, folder, reader, output)
+            phase_seconds = args._phase_seconds
         else:
             meshes = []
             failed_parts = []
@@ -476,6 +604,8 @@ def convert(args):
                     raise ValueError("Invalid body path in manifest.")
 
                 name = part.get("name") or f"Body_{index:03d}"
+                body_args = argparse.Namespace(**vars(args))
+                body_args.chord_mm = body_chord_mm(args, part)
                 usd_file = folder / f"body_{index:06d}.usdc"
                 args._body_index = index
                 args._body_name = name
@@ -487,17 +617,26 @@ def convert(args):
                 )
 
                 try:
-                    run_tool(
-                        [converter, brep_file, usd_file],
-                        env=environment,
-                    )
+                    conversion_started = time.perf_counter()
+                    try:
+                        run_tool(
+                            [converter, brep_file, usd_file],
+                            env=environment,
+                        )
+                    finally:
+                        phase_seconds["usd_conversion"] += time.perf_counter() - conversion_started
                     publish_progress(args, "tessellating", f"Tessellating: {name}")
                     print(f"[3/3] Tessellating: {name}", flush=True)
-                    body_meshes = tessellate_body(usd_file, name, args)
+                    tessellation_started = time.perf_counter()
+                    try:
+                        body_meshes = tessellate_body(usd_file, name, body_args)
+                    finally:
+                        phase_seconds["nvidia_tessellation"] += time.perf_counter() - tessellation_started
                     if not body_meshes:
                         raise ValueError("Body produced no meshes")
                     for item in body_meshes:
                         validate_mesh(item)
+                        item["assembly_id"] = part.get("assembly_id", 0)
                     meshes.extend(body_meshes)
                 except (RuntimeError, ValueError, TypeError, subprocess.CalledProcessError,
                         subprocess.TimeoutExpired) as error:
@@ -507,50 +646,30 @@ def convert(args):
                     fallback_file = folder / f"occt_{index:06d}.mesh.json"
                     publish_progress(args, "fallback", f"OCCT meshing: {name}")
                     print(f"Trying OCCT fallback: {name}", flush=True)
+                    fallback_started = time.perf_counter()
                     try:
-                        run_tool([reader, "--mesh", brep_file, fallback_file,
-                                  str(args.chord_mm), str(args.angle_deg)])
-                        with fallback_file.open(encoding="utf-8") as file:
-                            fallback = json.load(file)
-                        if (fallback.get("version") != 1 or fallback.get("units") != "mm"
-                                or fallback.get("mesher") != "occt"
-                                or fallback.get("missing_faces") != 0
-                                or fallback.get("status_flags") != 0
-                                or not fallback.get("face_count")):
-                            raise ValueError("OCCT returned an incomplete or incompatible mesh")
-                        item = {
-                            "name": name, "points": fallback["points"],
-                            "faces": fallback["faces"], "normals": fallback["normals"],
-                            "repair": None,
-                            "fallback": {
-                                "mesher": "occt", "nvidia_error": original_error,
-                                "chord_mm": fallback.get("chord_mm"),
-                                "angle_deg": fallback.get("angle_deg"),
-                                "face_count": fallback["face_count"],
-                                "degenerate_triangles_skipped": fallback.get("degenerate_triangles_skipped", 0),
-                                "normals": "flat triangle normals",
-                                "nurbs_face_count": fallback.get("nurbs_face_count", 0),
-                                "original_status_flags": fallback.get("original_status_flags", 0),
-                                "seam_continuity_verified": False,
-                            },
-                        }
-                        validate_mesh(item)
+                        item = mesh_with_occt_retry(
+                            reader, brep_file, fallback_file, name,
+                            original_error, body_args.chord_mm, body_args.angle_deg,
+                        )
+                        item["assembly_id"] = part.get("assembly_id", 0)
                         meshes.append(item)
                         args._completed = index
                         publish_progress(args, "processed", f"Imported with OCCT: {name}")
                         print(f"OCCT fallback succeeded: {name}", flush=True)
                         continue
-                    except (RuntimeError, ValueError, TypeError, KeyError,
-                            subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                        FileNotFoundError) as fallback_error:
+                    except RuntimeError as fallback_error:
                         error = RuntimeError(
                             f"{name}: NVIDIA failed: {original_error}; "
                             f"OCCT fallback failed: {fallback_error}")
+                    finally:
+                        phase_seconds["occt_fallback"] += time.perf_counter() - fallback_started
                     if not getattr(args, "skip_failed", False):
                         raise error
                     # Keep source geometry for skipped parts, even though this
                     # import may succeed and remove its normal temporary files.
                     failure = {"part_index": index, "name": name,
+                               "assembly_id": part.get("assembly_id", 0),
                                "error": str(error), "diagnostics": None}
                     try:
                         diagnostics = Path(tempfile.mkdtemp(prefix="step_skipped_part_"))
@@ -573,6 +692,8 @@ def convert(args):
                 args._completed = index
                 publish_progress(args, "processed", f"Processed: {name}")
 
+        processing_seconds = time.perf_counter() - processing_started
+
         if not meshes:
             failures_file = output.with_suffix(".failures.json")
             failures_file.write_text(
@@ -586,6 +707,19 @@ def convert(args):
             )
 
         publish_progress(args, "writing", "Writing converted mesh data...")
+        writing_started = time.perf_counter()
+        # Embed these measurements in the successful result so Blender can
+        # report them even if the separate log's final line is unavailable.
+        timing_summary = {
+            "step_split": round(split_seconds, 3),
+            "body_processing_wall": round(processing_seconds, 3),
+            "usd_conversion_sum": round(phase_seconds["usd_conversion"], 3),
+            "nvidia_tessellation_sum": round(phase_seconds["nvidia_tessellation"], 3),
+            "occt_fallback_sum": round(phase_seconds["occt_fallback"], 3),
+            "worker_before_write_wall": round(writing_started - started, 3),
+            "jobs": args.jobs,
+            "bodies": len(parts),
+        }
         payload = json.dumps(
             {
                 "units": "mm",
@@ -595,6 +729,10 @@ def convert(args):
                 "failed_parts": failed_parts,
                 "source_body_count": len(parts),
                 "partial_import": bool(failed_parts),
+                "assemblies": assemblies if not getattr(args, "body_job", False) else [],
+                "manifest_version": 2 if getattr(args, "body_job", False) else manifest["version"],
+                "phase_seconds": phase_seconds,
+                "timings": timing_summary,
             },
             allow_nan=False,
         )
@@ -619,7 +757,14 @@ def convert(args):
             if pending is not None:
                 pending.unlink(missing_ok=True)
 
+        writing_seconds = time.perf_counter() - writing_started
+
     publish_progress(args, "done", "Conversion complete")
+    print("STEP_TIMING " + json.dumps({
+        **timing_summary,
+        "json_write": round(writing_seconds, 3),
+        "total_worker_wall": round(time.perf_counter() - started, 3),
+    }), flush=True)
     print(f"Completed: {len(meshes)} mesh objects; {len(failed_parts)} bodies skipped", flush=True)
     print(f"Saved: {output}", flush=True)
 
@@ -633,6 +778,12 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--chord-mm", type=float, default=0.1)
     parser.add_argument("--angle-deg", type=float, default=15.0)
+    parser.add_argument("--adaptive", action="store_true",
+                        help="Set each body's chord from its diagonal and adaptive detail controls.")
+    parser.add_argument("--adaptive-percent", type=float, default=0.1,
+                        help="Chord as percentage of the body's diagonal (default: 0.1).")
+    parser.add_argument("--adaptive-min-chord-mm", type=float, default=0.02)
+    parser.add_argument("--adaptive-max-chord-mm", type=float, default=0.1)
 
     parser.add_argument(
         "--repair-failed", action="store_true",
