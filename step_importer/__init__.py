@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SimpleStep importer",
     "author": "SimpleStep contributors",
-    "version": (1, 3, 0),
+    "version": (1, 5, 0),
     "blender": (5, 2, 0),
     "location": "File > Import",
     "description": "Import STEP using Open CASCADE and NVIDIA USD BRep",

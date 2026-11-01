@@ -106,13 +106,37 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
         default=True,
     )
 
-    rotation_x_deg: FloatProperty(
-        name="X rotation (degrees)",
-        description="Rotate the complete imported assembly around the global X axis",
-        default=-90.0,
-        min=-360.0,
-        max=360.0,
-        precision=1,
+    origin_mode: EnumProperty(
+        name="Object origin",
+        description="Changes the object pivot only; the visible shape stays in place",
+        items=(
+            ("CENTER", "Bounds center", "Put each pivot at its local mesh bounds center"),
+            ("CAD", "CAD origin", "Keep each prototype's source CAD pivot"),
+        ),
+        default="CENTER",
+    )
+
+    source_up_axis: EnumProperty(
+        name="Source up axis",
+        description="Rotate the complete model so the selected STEP axis points up in Blender",
+        items=(
+            ("Z", "Z up (unchanged)", "Keep the original STEP orientation"),
+            ("Y", "Y up", "Rotate the whole model so source +Y points toward Blender +Z"),
+            ("X", "X up", "Rotate the whole model so source +X points toward Blender +Z"),
+        ),
+        default="Z",
+    )
+
+    share_meshes: BoolProperty(
+        name="Share repeated mesh data",
+        description="Repeated parts use the same Blender mesh; turn off to edit each separately",
+        default=True,
+    )
+
+    use_step_colors: BoolProperty(
+        name="Import STEP colors",
+        description="Create Blender materials for colors assigned to STEP parts",
+        default=True,
     )
 
     repair_failed: BoolProperty(
@@ -182,7 +206,10 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
 
         layout.separator()
         layout.prop(self, "parallel_bodies")
-        layout.prop(self, "rotation_x_deg")
+        layout.prop(self, "source_up_axis")
+        layout.prop(self, "origin_mode")
+        layout.prop(self, "share_meshes")
+        layout.prop(self, "use_step_colors")
         layout.prop(self, "use_normals")
         layout.prop(self, "repair_failed")
         if self.repair_failed:
