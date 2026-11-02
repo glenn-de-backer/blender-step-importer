@@ -133,6 +133,12 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    follow_import_build: BoolProperty(
+        name="Follow model while importing",
+        description="Frame the growing imported model in the 3D View as Blender creates objects",
+        default=False,
+    )
+
     use_step_colors: BoolProperty(
         name="Import STEP colors",
         description="Create Blender materials for colors assigned to STEP parts",
@@ -218,6 +224,7 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
         layout.prop(self, "source_up_axis")
         layout.prop(self, "origin_mode")
         layout.prop(self, "share_meshes")
+        layout.prop(self, "follow_import_build")
         layout.prop(self, "use_step_colors")
         if self.use_step_colors:
             layout.prop(self, "color_uncolored_parts")

@@ -18,7 +18,7 @@ for stream in (sys.stdout, sys.stderr):
             errors="backslashreplace",
         )
 
-WORKER_VERSION = "1.5.2"
+WORKER_VERSION = "1.5.3"
 
 import usd_brep as sm
 

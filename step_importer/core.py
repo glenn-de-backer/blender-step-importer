@@ -16,6 +16,15 @@ active_import = None
 viewport_notice = None
 notice_draw_handle = None
 notice_timer_running = False
+NOTICE_SECONDS = 6.0
+
+
+def current_scene_key():
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return None
+    as_pointer = getattr(scene, "as_pointer", None)
+    return as_pointer() if as_pointer is not None else id(scene)
 
 
 def redraw_viewports():
@@ -25,9 +34,14 @@ def redraw_viewports():
                 area.tag_redraw()
 
 
-def clear_viewport_notice():
-    global viewport_notice, notice_draw_handle
+def clear_viewport_notice(*, cancel_timer=True):
+    global viewport_notice, notice_draw_handle, notice_timer_running
     viewport_notice = None
+    timers = bpy.app.timers
+    is_registered = getattr(timers, "is_registered", None)
+    if cancel_timer and is_registered is not None and is_registered(expire_viewport_notice):
+        timers.unregister(expire_viewport_notice)
+    notice_timer_running = False
     if notice_draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(notice_draw_handle, "WINDOW")
         notice_draw_handle = None
@@ -39,26 +53,41 @@ def expire_viewport_notice():
     if viewport_notice is None:
         notice_timer_running = False
         return None
+    if (viewport_notice.get("scene_key") is not None
+            and viewport_notice["scene_key"] != current_scene_key()):
+        clear_viewport_notice(cancel_timer=False)
+        return None
     remaining = viewport_notice["until"] - time.monotonic()
     if remaining > 0:
         return max(0.1, remaining)
-    clear_viewport_notice()
-    notice_timer_running = False
+    clear_viewport_notice(cancel_timer=False)
     return None
 
 
-def show_viewport_notice(*lines, seconds=20.0):
+def show_viewport_notice(*lines, seconds=NOTICE_SECONDS):
     """Show the import result in the 3D view after the modal job ends."""
     global viewport_notice, notice_draw_handle, notice_timer_running
-    viewport_notice = {"lines": lines, "until": time.monotonic() + seconds}
+    viewport_notice = {
+        "lines": lines,
+        "until": time.monotonic() + seconds,
+        "scene_key": current_scene_key(),
+    }
     if notice_draw_handle is None:
         notice_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             draw_import_progress, (), "WINDOW", "POST_PIXEL",
         )
-    if not notice_timer_running:
+    is_registered = getattr(bpy.app.timers, "is_registered", None)
+    if not (is_registered(expire_viewport_notice) if is_registered else notice_timer_running):
         notice_timer_running = True
         bpy.app.timers.register(expire_viewport_notice, first_interval=seconds)
     redraw_viewports()
+
+
+def clear_on_file_load(_filepath):
+    """Drop stale draw handlers when Blender loads a file or startup scene."""
+    if active_import is not None:
+        active_import.cleanup()
+    clear_viewport_notice()
 
 
 def prepare_meshes(payload, scene_scale):
@@ -183,9 +212,50 @@ def read_worker_timings(log_path):
     return None
 
 
+def follow_import_view(context, obj, state, *, force=False):
+    """Frame accumulated world bounds without changing the viewport rotation."""
+    if obj is not None:
+        from mathutils import Vector
+
+        bounds = state.setdefault("bounds", [[math.inf] * 3, [-math.inf] * 3])
+        for corner in obj.bound_box:
+            point = obj.matrix_world @ Vector(corner)
+            for axis in range(3):
+                bounds[0][axis] = min(bounds[0][axis], point[axis])
+                bounds[1][axis] = max(bounds[1][axis], point[axis])
+
+    bounds = state.get("bounds")
+    if bounds is None:
+        return
+    now = time.monotonic()
+    if not force and now - state.get("last_update", -math.inf) < 0.4:
+        return
+
+    windows = list(context.window_manager.windows)
+    preferred = getattr(context, "window", None)
+    ordered = ([preferred] if preferred is not None else [])
+    ordered.extend(window for window in windows if window != preferred)
+    for window in ordered:
+        for area in window.screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            region = area.spaces.active.region_3d
+            if region is None or region.view_perspective == "CAMERA":
+                continue
+            center = [(bounds[0][i] + bounds[1][i]) * 0.5 for i in range(3)]
+            diagonal = math.sqrt(sum((bounds[1][i] - bounds[0][i]) ** 2
+                                     for i in range(3)))
+            region.view_location = center
+            region.view_distance = max(0.05, diagonal * 1.5)
+            area.tag_redraw()
+            state["last_update"] = now
+            return
+
+
 def create_objects_iter(context, payload, source, use_normals,
                         origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
-                        use_step_colors=True, color_uncolored_parts=False):
+                        use_step_colors=True, color_uncolored_parts=False,
+                        follow_import_build=False):
     """Create bodies incrementally; closing the iterator rolls back."""
     if origin_mode not in {"CENTER", "CAD"}:
         raise ValueError("Unknown object origin mode.")
@@ -194,7 +264,8 @@ def create_objects_iter(context, payload, source, use_normals,
     if payload.get("manifest_version") == 4:
         return (yield from create_instances_iter(
             context, payload, source, use_normals, origin_mode, share_meshes,
-            source_up_axis, use_step_colors, color_uncolored_parts))
+            source_up_axis, use_step_colors, color_uncolored_parts,
+            follow_import_build))
     up_rotation = source_up_rotation(source_up_axis) if source_up_axis != "Z" else None
     total = len(payload["meshes"])
     if not total:
@@ -209,6 +280,7 @@ def create_objects_iter(context, payload, source, use_normals,
     report_text = None
     color_materials = {}
     created_materials = []
+    view_state = {}
 
     try:
         context.scene.collection.children.link(collection)
@@ -305,9 +377,15 @@ def create_objects_iter(context, payload, source, use_normals,
                     repair.get("accepted_non_manifold")
                 )
 
+            if follow_import_build:
+                follow_import_view(context, obj, view_state)
+
             # Drop temporary coordinate lists before yielding to the UI.
             del points, local_points, faces, normals
             yield index, total, name
+
+        if follow_import_build:
+            follow_import_view(context, None, view_state, force=True)
 
         repaired = [item for item in payload["meshes"] if item.get("repair")]
         skipped = payload.get("failed_parts", [])
@@ -394,7 +472,7 @@ def source_up_rotation(source_up_axis):
 def create_instances_iter(context, payload, source, use_normals,
                           origin_mode="CENTER", share_meshes=True,
                           source_up_axis="Z", use_step_colors=True,
-                          color_uncolored_parts=False):
+                          color_uncolored_parts=False, follow_import_build=False):
     """Convert each prototype once, optionally copy its Blender mesh per instance."""
     from mathutils import Matrix, Vector
 
@@ -427,6 +505,7 @@ def create_instances_iter(context, payload, source, use_normals,
     )
     objects = []
     report_text = None
+    view_state = {}
     try:
         context.scene.collection.children.link(collection)
         collection["step_manifest_version"] = 4
@@ -512,7 +591,12 @@ def create_instances_iter(context, payload, source, use_normals,
             item = definitions[identifier]
             obj["step_mesher"] = "OCCT" if item.get("fallback") else "NVIDIA"
             obj["step_repaired"] = bool(item.get("repair"))
+            if follow_import_build:
+                follow_import_view(context, obj, view_state)
             yield len(objects), available, inst["name"]
+
+        if follow_import_build:
+            follow_import_view(context, None, view_state, force=True)
 
         skipped = payload.get("failed_parts", [])
         recovered = [inst for inst in payload["instances"]
@@ -555,11 +639,13 @@ def create_instances_iter(context, payload, source, use_normals,
 
 def create_objects(context, payload, source, use_normals,
                    origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
-                   use_step_colors=True, color_uncolored_parts=False):
+                   use_step_colors=True, color_uncolored_parts=False,
+                   follow_import_build=False):
     """Synchronous wrapper retained for tests and scripts."""
     iterator = create_objects_iter(
         context, payload, source, use_normals, origin_mode, share_meshes,
         source_up_axis, use_step_colors, color_uncolored_parts,
+        follow_import_build,
     )
     while True:
         try:
@@ -586,6 +672,11 @@ def draw_import_progress():
             lines = (title, status)
         lines += (f"Elapsed {elapsed // 60:02d}:{elapsed % 60:02d} | Esc to cancel",)
     elif viewport_notice is not None:
+        if (time.monotonic() >= viewport_notice.get("until", float("inf"))
+                or (viewport_notice.get("scene_key") is not None
+                    and viewport_notice["scene_key"] != current_scene_key())):
+            clear_viewport_notice()
+            return
         lines = viewport_notice["lines"]
     else:
         return
@@ -902,7 +993,9 @@ class StepImportEngine:
                 tick_started = time.monotonic()
                 # Batch small parts, but yield to Blender between batches.
                 # A single expensive body can exceed this soft time budget.
-                for _ in range(8):
+                preview_count = len(self._payload.get("instances") or self._payload["meshes"])
+                batch_size = 1 if self.follow_import_build and preview_count <= 200 else 8
+                for _ in range(batch_size):
                     try:
                         completed, total, name = next(self._creator)
                     except StopIteration as finished:
@@ -928,6 +1021,7 @@ class StepImportEngine:
                     context, self._payload, self._source, self.use_normals,
                     self.origin_mode, self.share_meshes, self.source_up_axis,
                     self.use_step_colors, self.color_uncolored_parts,
+                    self.follow_import_build,
                 )
                 self._creating_started = time.monotonic()
                 self._phase = "creating"
