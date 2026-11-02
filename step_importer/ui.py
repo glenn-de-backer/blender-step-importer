@@ -71,7 +71,7 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
     adaptive_min_chord_mm: FloatProperty(
         name="Minimum chord (mm)",
         description="Prevent extremely dense meshes on very small parts",
-        default=0.02,
+        default=0.01,
         min=0.0001,
         max=10.0,
         precision=4,
@@ -80,7 +80,7 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
     adaptive_max_chord_mm: FloatProperty(
         name="Maximum chord (mm)",
         description="Smaller values keep rounded details smoother on large parts",
-        default=0.1,
+        default=0.02,
         min=0.0001,
         max=10.0,
         precision=4,
@@ -137,6 +137,15 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
         name="Import STEP colors",
         description="Create Blender materials for colors assigned to STEP parts",
         default=True,
+    )
+
+    color_uncolored_parts: BoolProperty(
+        name="Color parts without STEP colors",
+        description=(
+            "Assign stable varied colors to uncolored parts; repeated parts "
+            "share a color and STEP colors take precedence"
+        ),
+        default=False,
     )
 
     repair_failed: BoolProperty(
@@ -210,6 +219,8 @@ class IMPORT_OT_step_nvidia(StepImportEngine, bpy.types.Operator, ImportHelper):
         layout.prop(self, "origin_mode")
         layout.prop(self, "share_meshes")
         layout.prop(self, "use_step_colors")
+        if self.use_step_colors:
+            layout.prop(self, "color_uncolored_parts")
         layout.prop(self, "use_normals")
         layout.prop(self, "repair_failed")
         if self.repair_failed:

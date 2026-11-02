@@ -1,3 +1,4 @@
+import colorsys
 import json
 import math
 import os
@@ -159,6 +160,13 @@ def step_color_material(rgba, cache, created):
         cache[key] = material
     return cache[key]
 
+
+def generated_part_color(identifier):
+    """Give each uncolored prototype a stable, visually distinct color."""
+    hue = (identifier * 0.6180339887498949) % 1.0
+    return (*colorsys.hsv_to_rgb(hue, 0.55, 0.85), 1.0)
+
+
 def read_worker_timings(log_path):
     """Read the final timing packet before temporary job files are removed."""
     try:
@@ -177,7 +185,7 @@ def read_worker_timings(log_path):
 
 def create_objects_iter(context, payload, source, use_normals,
                         origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
-                        use_step_colors=True):
+                        use_step_colors=True, color_uncolored_parts=False):
     """Create bodies incrementally; closing the iterator rolls back."""
     if origin_mode not in {"CENTER", "CAD"}:
         raise ValueError("Unknown object origin mode.")
@@ -186,7 +194,7 @@ def create_objects_iter(context, payload, source, use_normals,
     if payload.get("manifest_version") == 4:
         return (yield from create_instances_iter(
             context, payload, source, use_normals, origin_mode, share_meshes,
-            source_up_axis, use_step_colors))
+            source_up_axis, use_step_colors, color_uncolored_parts))
     up_rotation = source_up_rotation(source_up_axis) if source_up_axis != "Z" else None
     total = len(payload["meshes"])
     if not total:
@@ -259,9 +267,13 @@ def create_objects_iter(context, payload, source, use_normals,
             obj = bpy.data.objects.new(name, mesh)
             objects.append(obj)
 
-            if use_step_colors and item.get("color") is not None:
-                mesh.materials.append(step_color_material(
-                    item["color"], color_materials, created_materials))
+            if use_step_colors:
+                color = item.get("color")
+                if color is None and color_uncolored_parts:
+                    color = generated_part_color(index)
+                if color is not None:
+                    mesh.materials.append(step_color_material(
+                        color, color_materials, created_materials))
 
             # Keep the STEP axes and the original body placement.
             if up_rotation is None:
@@ -381,7 +393,8 @@ def source_up_rotation(source_up_axis):
 
 def create_instances_iter(context, payload, source, use_normals,
                           origin_mode="CENTER", share_meshes=True,
-                          source_up_axis="Z", use_step_colors=True):
+                          source_up_axis="Z", use_step_colors=True,
+                          color_uncolored_parts=False):
     """Convert each prototype once, optionally copy its Blender mesh per instance."""
     from mathutils import Matrix, Vector
 
@@ -407,10 +420,11 @@ def create_instances_iter(context, payload, source, use_normals,
     created_meshes = []
     created_materials = []
     color_materials = {}
-    colored_prototypes = {
-        inst["prototype_id"] for inst in payload["instances"]
-        if inst.get("color") is not None
-    } if use_step_colors else set()
+    colored_prototypes = (
+        {inst["prototype_id"] for inst in payload["instances"]
+         if color_uncolored_parts or inst.get("color") is not None}
+        if use_step_colors else set()
+    )
     objects = []
     report_text = None
     try:
@@ -481,9 +495,12 @@ def create_instances_iter(context, payload, source, use_normals,
             if identifier in colored_prototypes:
                 slot = obj.material_slots[0]
                 slot.link = "OBJECT"
-                if inst.get("color") is not None:
+                color = inst.get("color")
+                if color is None and color_uncolored_parts:
+                    color = generated_part_color(identifier)
+                if color is not None:
                     slot.material = step_color_material(
-                        inst["color"], color_materials, created_materials)
+                        color, color_materials, created_materials)
                 else:
                     slot.material = color_materials[(0.8, 0.8, 0.8, 1.0)]
             obj["step_source"] = str(source)
@@ -538,11 +555,11 @@ def create_instances_iter(context, payload, source, use_normals,
 
 def create_objects(context, payload, source, use_normals,
                    origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
-                   use_step_colors=True):
+                   use_step_colors=True, color_uncolored_parts=False):
     """Synchronous wrapper retained for tests and scripts."""
     iterator = create_objects_iter(
         context, payload, source, use_normals, origin_mode, share_meshes,
-        source_up_axis, use_step_colors,
+        source_up_axis, use_step_colors, color_uncolored_parts,
     )
     while True:
         try:
@@ -910,7 +927,7 @@ class StepImportEngine:
                 self._creator = create_objects_iter(
                     context, self._payload, self._source, self.use_normals,
                     self.origin_mode, self.share_meshes, self.source_up_axis,
-                    self.use_step_colors,
+                    self.use_step_colors, self.color_uncolored_parts,
                 )
                 self._creating_started = time.monotonic()
                 self._phase = "creating"
@@ -973,12 +990,7 @@ class StepImportEngine:
         if process is not None and process.poll() is None:
             try:
                 subprocess.run(
-                    [
-                        "taskkill",
-                        "/PID", str(process.pid),
-                        "/T",
-                        "/F",
-                    ],
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,

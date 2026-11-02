@@ -18,7 +18,7 @@ for stream in (sys.stdout, sys.stderr):
             errors="backslashreplace",
         )
 
-WORKER_VERSION = "1.5.0"
+WORKER_VERSION = "1.5.2"
 
 import usd_brep as sm
 
@@ -248,8 +248,8 @@ def body_chord_mm(args, part):
     if not getattr(args, "adaptive", False):
         return args.chord_mm
     percent = getattr(args, "adaptive_percent", 0.1)
-    minimum = getattr(args, "adaptive_min_chord_mm", 0.02)
-    maximum = getattr(args, "adaptive_max_chord_mm", 0.1)
+    minimum = getattr(args, "adaptive_min_chord_mm", 0.01)
+    maximum = getattr(args, "adaptive_max_chord_mm", 0.02)
     if (not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0
                 for v in (percent, minimum, maximum)) or minimum > maximum):
         raise ValueError("Invalid adaptive detail settings: minimum must not exceed maximum.")
@@ -575,9 +575,7 @@ def convert(args):
     environment["OMNISOLID_PLUGIN_PATH"] = str(schema)
     environment["PXR_PLUGINPATH_NAME"] = str(nvidia / "plugin")
     environment["PATH"] = os.pathsep.join([
-        str(nvidia),
-        str(nvidia / "extraLibs"),
-        environment.get("PATH", ""),
+        str(nvidia), str(nvidia / "extraLibs"), environment.get("PATH", "")
     ])
 
     with tempfile.TemporaryDirectory(prefix="step_import_") as folder:
@@ -851,8 +849,8 @@ def main():
                         help="Set each body's chord from its diagonal and adaptive detail controls.")
     parser.add_argument("--adaptive-percent", type=float, default=0.1,
                         help="Chord as percentage of the body's diagonal (default: 0.1).")
-    parser.add_argument("--adaptive-min-chord-mm", type=float, default=0.02)
-    parser.add_argument("--adaptive-max-chord-mm", type=float, default=0.1)
+    parser.add_argument("--adaptive-min-chord-mm", type=float, default=0.01)
+    parser.add_argument("--adaptive-max-chord-mm", type=float, default=0.02)
 
     parser.add_argument(
         "--repair-failed", action="store_true",
