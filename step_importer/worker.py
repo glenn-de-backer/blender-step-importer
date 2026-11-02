@@ -18,7 +18,7 @@ for stream in (sys.stdout, sys.stderr):
             errors="backslashreplace",
         )
 
-WORKER_VERSION = "1.3.0"
+WORKER_VERSION = "1.5.2"
 
 import usd_brep as sm
 
@@ -248,8 +248,8 @@ def body_chord_mm(args, part):
     if not getattr(args, "adaptive", False):
         return args.chord_mm
     percent = getattr(args, "adaptive_percent", 0.1)
-    minimum = getattr(args, "adaptive_min_chord_mm", 0.02)
-    maximum = getattr(args, "adaptive_max_chord_mm", 0.1)
+    minimum = getattr(args, "adaptive_min_chord_mm", 0.01)
+    maximum = getattr(args, "adaptive_max_chord_mm", 0.02)
     if (not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0
                 for v in (percent, minimum, maximum)) or minimum > maximum):
         raise ValueError("Invalid adaptive detail settings: minimum must not exceed maximum.")
@@ -266,9 +266,9 @@ def body_chord_mm(args, part):
 def validate_assembly_manifest(manifest):
     """Accept the old flat format and a preorder tree of assembly occurrences."""
     version = manifest.get("version")
-    if version not in (2, 3):
-        raise ValueError("Expected body manifest version 2 or 3.")
-    assemblies = manifest.get("assemblies", []) if version == 3 else []
+    if version not in (2, 3, 4):
+        raise ValueError("Expected body manifest version 2, 3 or 4.")
+    assemblies = manifest.get("assemblies", []) if version >= 3 else []
     if not isinstance(assemblies, list):
         raise ValueError("Invalid assembly list.")
     known = {0}
@@ -284,6 +284,32 @@ def validate_assembly_manifest(manifest):
     for part in manifest.get("parts", []):
         if type(part.get("assembly_id", 0)) is not int or part.get("assembly_id", 0) not in known:
             raise ValueError("Part references an unknown assembly.")
+    if version == 4:
+        prototypes = manifest.get("prototypes")
+        if not isinstance(prototypes, list) or not prototypes:
+            raise ValueError("Missing prototype definitions.")
+        ids = set()
+        for prototype in prototypes:
+            identifier = prototype.get("id")
+            if (type(identifier) is not int or identifier <= 0 or identifier in ids
+                    or not isinstance(prototype.get("file"), str)):
+                raise ValueError("Invalid prototype definition.")
+            ids.add(identifier)
+        for part in manifest.get("parts", []):
+            values = part.get("transform")
+            if (part.get("prototype_id") not in ids
+                    or not isinstance(part.get("name"), str)
+                    or not isinstance(values, list) or len(values) != 16
+                    or any(type(v) not in (float, int) or not math.isfinite(v) for v in values)
+                    or values[12:] != [0, 0, 0, 1]):
+                raise ValueError("Invalid prototype instance or transform.")
+            color = part.get("color")
+            if color is not None and (
+                not isinstance(color, list) or len(color) != 4
+                or any(type(v) not in (float, int) or not math.isfinite(v)
+                       or v < 0 or v > 1 for v in color)
+            ):
+                raise ValueError("Invalid STEP part color.")
     return assemblies
 
 
@@ -346,9 +372,22 @@ def mesh_with_occt_retry(reader, brep_file, fallback_file, name,
     raise RuntimeError("; ".join(errors))
 
 
+def schedule_part_indices(parts, parts_folder):
+    """Start likely expensive bodies early; keep result indices in STEP order."""
+    root = parts_folder.resolve()
+    sizes = []
+    for index, part in enumerate(parts, 1):
+        path = (root / part["file"]).resolve(strict=True)
+        if path.parent != root:
+            raise ValueError("Invalid body path in manifest.")
+        sizes.append((index, path.stat().st_size))
+    return [index for index, _ in sorted(sizes, key=lambda item: (-item[1], item[0]))]
+
+
 def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
     """Run bounded isolated Python workers; return results in STEP order."""
     count = len(parts)
+    work_order = schedule_part_indices(parts, parts_folder)
     results = [None] * count
     args._body_total = count
     args._completed = 0
@@ -408,13 +447,14 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
     # Submit only bounded work. A strict failure cannot leave 214 jobs queued.
     pool = ThreadPoolExecutor(max_workers=args.jobs)
     futures = {}
-    next_index = 1
+    next_position = 0
     last_completed = time.monotonic()
     try:
-        while next_index <= count and len(futures) < args.jobs:
-            future = pool.submit(one_body, next_index, parts[next_index - 1])
-            futures[future] = next_index
-            next_index += 1
+        while next_position < count and len(futures) < args.jobs:
+            index = work_order[next_position]
+            future = pool.submit(one_body, index, parts[index - 1])
+            futures[future] = index
+            next_position += 1
         while futures:
             # Keep the viewport alive while a large body occupies every worker.
             done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -457,6 +497,8 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
                     meshes = data["meshes"]
                     for item in meshes:
                         item["assembly_id"] = parts[part_index - 1].get("assembly_id", 0)
+                        if "id" in parts[part_index - 1]:
+                            item["prototype_id"] = parts[part_index - 1]["id"]
                     for phase in args._phase_seconds:
                         args._phase_seconds[phase] += data.get("phase_seconds", {}).get(phase, 0.0)
                     failures = data.get("failed_parts", [])
@@ -472,10 +514,11 @@ def convert_parts_parallel(args, parts, parts_folder, folder, reader, output):
                 args._body_index = part_index
                 args._body_name = name
                 publish_progress(args, "processed", f"Processed: {name}")
-                if next_index <= count:
+                if next_position < count:
+                    next_index = work_order[next_position]
                     pending = pool.submit(one_body, next_index, parts[next_index - 1])
                     futures[pending] = next_index
-                    next_index += 1
+                    next_position += 1
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     meshes = []
@@ -532,13 +575,12 @@ def convert(args):
     environment["OMNISOLID_PLUGIN_PATH"] = str(schema)
     environment["PXR_PLUGINPATH_NAME"] = str(nvidia / "plugin")
     environment["PATH"] = os.pathsep.join([
-        str(nvidia),
-        str(nvidia / "extraLibs"),
-        environment.get("PATH", ""),
+        str(nvidia), str(nvidia / "extraLibs"), environment.get("PATH", "")
     ])
 
     with tempfile.TemporaryDirectory(prefix="step_import_") as folder:
         folder = Path(folder)
+        occurrences = None
         if getattr(args, "body_job", False):
             parts_folder = source.parent
             parts = [{"file": source.name, "name": args.body_name or source.stem}]
@@ -572,7 +614,10 @@ def convert(args):
             if manifest.get("units") != "mm":
                 raise ValueError("Expected millimeter geometry.")
 
-            parts = manifest.get("parts", [])
+            occurrences = manifest.get("parts", [])
+            parts = manifest["prototypes"] if manifest["version"] == 4 else occurrences
+            if manifest["version"] == 4:
+                parts = [{**p, "name": f"Prototype_{p['id']}"} for p in parts]
 
             if not parts:
                 raise RuntimeError("The STEP reader exported no bodies.")
@@ -582,7 +627,7 @@ def convert(args):
                 for part in parts:
                     body_chord_mm(args, part)
 
-            print(f"STEP bodies: {len(parts)}", flush=True)
+            print(f"STEP bodies: {len(occurrences)}; unique prototypes: {len(parts)}", flush=True)
 
         processing_started = time.perf_counter()
         if not getattr(args, "body_job", False) and getattr(args, "jobs", 1) > 1:
@@ -637,6 +682,8 @@ def convert(args):
                     for item in body_meshes:
                         validate_mesh(item)
                         item["assembly_id"] = part.get("assembly_id", 0)
+                        if "id" in part:
+                            item["prototype_id"] = part["id"]
                     meshes.extend(body_meshes)
                 except (RuntimeError, ValueError, TypeError, subprocess.CalledProcessError,
                         subprocess.TimeoutExpired) as error:
@@ -653,6 +700,8 @@ def convert(args):
                             original_error, body_args.chord_mm, body_args.angle_deg,
                         )
                         item["assembly_id"] = part.get("assembly_id", 0)
+                        if "id" in part:
+                            item["prototype_id"] = part["id"]
                         meshes.append(item)
                         args._completed = index
                         publish_progress(args, "processed", f"Imported with OCCT: {name}")
@@ -694,6 +743,20 @@ def convert(args):
 
         processing_seconds = time.perf_counter() - processing_started
 
+        if occurrences is not None and manifest["version"] == 4:
+            successful = {item["prototype_id"] for item in meshes}
+            missing = {part["id"] for part in parts} - successful
+            failures_by_id = {parts[f["part_index"] - 1]["id"]: f for f in failed_parts}
+            failed_parts = [
+                {"part_index": index, "name": part["name"],
+                 "assembly_id": part["assembly_id"],
+                 "prototype_id": part["prototype_id"],
+                 "error": failures_by_id.get(part["prototype_id"], {}).get("error", "Prototype unavailable"),
+                 "diagnostics": failures_by_id.get(part["prototype_id"], {}).get("diagnostics")}
+                for index, part in enumerate(occurrences, 1)
+                if part["prototype_id"] in missing
+            ]
+
         if not meshes:
             failures_file = output.with_suffix(".failures.json")
             failures_file.write_text(
@@ -718,7 +781,8 @@ def convert(args):
             "occt_fallback_sum": round(phase_seconds["occt_fallback"], 3),
             "worker_before_write_wall": round(writing_started - started, 3),
             "jobs": args.jobs,
-            "bodies": len(parts),
+            "bodies": len(occurrences) if occurrences is not None else len(parts),
+            "prototypes": len(parts),
         }
         payload = json.dumps(
             {
@@ -727,7 +791,9 @@ def convert(args):
                 "meshes": meshes,
                 "repair_enabled": args.repair_failed,
                 "failed_parts": failed_parts,
-                "source_body_count": len(parts),
+                "source_body_count": len(occurrences) if occurrences is not None else len(parts),
+                "source_prototype_count": len(parts),
+                "instances": occurrences if occurrences is not None and manifest["version"] == 4 else [],
                 "partial_import": bool(failed_parts),
                 "assemblies": assemblies if not getattr(args, "body_job", False) else [],
                 "manifest_version": 2 if getattr(args, "body_job", False) else manifest["version"],
@@ -765,7 +831,8 @@ def convert(args):
         "json_write": round(writing_seconds, 3),
         "total_worker_wall": round(time.perf_counter() - started, 3),
     }), flush=True)
-    print(f"Completed: {len(meshes)} mesh objects; {len(failed_parts)} bodies skipped", flush=True)
+    print(f"Completed: {len(meshes)} unique mesh definitions; "
+          f"{len(failed_parts)} source occurrences skipped", flush=True)
     print(f"Saved: {output}", flush=True)
 
 
@@ -782,8 +849,8 @@ def main():
                         help="Set each body's chord from its diagonal and adaptive detail controls.")
     parser.add_argument("--adaptive-percent", type=float, default=0.1,
                         help="Chord as percentage of the body's diagonal (default: 0.1).")
-    parser.add_argument("--adaptive-min-chord-mm", type=float, default=0.02)
-    parser.add_argument("--adaptive-max-chord-mm", type=float, default=0.1)
+    parser.add_argument("--adaptive-min-chord-mm", type=float, default=0.01)
+    parser.add_argument("--adaptive-max-chord-mm", type=float, default=0.02)
 
     parser.add_argument(
         "--repair-failed", action="store_true",

@@ -1,3 +1,4 @@
+import colorsys
 import json
 import math
 import os
@@ -138,12 +139,32 @@ def prepare_meshes(payload, scene_scale):
 
     return prepared
 
-def rotate_position_x(position, angle_degrees):
-    """Rotate an object's origin around the global X axis."""
-    radians = math.radians(angle_degrees)
-    cosine, sine = math.cos(radians), math.sin(radians)
-    x, y, z = position
-    return (x, y * cosine - z * sine, y * sine + z * cosine)
+
+def step_color_material(rgba, cache, created):
+    """Share materials by color while allowing different colors per occurrence."""
+    color = tuple(float(value) for value in rgba)
+    if len(color) != 4 or any(not math.isfinite(v) or v < 0 or v > 1 for v in color):
+        raise ValueError("Invalid STEP part color.")
+    key = tuple(round(value, 6) for value in color)
+    if key not in cache:
+        material = bpy.data.materials.new(
+            "STEP #{:02X}{:02X}{:02X}".format(
+                *(round(value * 255) for value in color[:3])))
+        created.append(material)
+        material.diffuse_color = color
+        material.use_nodes = True
+        principled = material.node_tree.nodes.get("Principled BSDF")
+        if principled is not None:
+            principled.inputs["Base Color"].default_value = color
+            principled.inputs["Alpha"].default_value = color[3]
+        cache[key] = material
+    return cache[key]
+
+
+def generated_part_color(identifier):
+    """Give each uncolored prototype a stable, visually distinct color."""
+    hue = (identifier * 0.6180339887498949) % 1.0
+    return (*colorsys.hsv_to_rgb(hue, 0.55, 0.85), 1.0)
 
 
 def read_worker_timings(log_path):
@@ -162,8 +183,19 @@ def read_worker_timings(log_path):
     return None
 
 
-def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-90.0):
+def create_objects_iter(context, payload, source, use_normals,
+                        origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
+                        use_step_colors=True, color_uncolored_parts=False):
     """Create bodies incrementally; closing the iterator rolls back."""
+    if origin_mode not in {"CENTER", "CAD"}:
+        raise ValueError("Unknown object origin mode.")
+    if source_up_axis not in {"X", "Y", "Z"}:
+        raise ValueError("Unknown source up axis.")
+    if payload.get("manifest_version") == 4:
+        return (yield from create_instances_iter(
+            context, payload, source, use_normals, origin_mode, share_meshes,
+            source_up_axis, use_step_colors, color_uncolored_parts))
+    up_rotation = source_up_rotation(source_up_axis) if source_up_axis != "Z" else None
     total = len(payload["meshes"])
     if not total:
         raise ValueError("Worker returned no meshes.")
@@ -175,6 +207,8 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
     objects = []
     meshes = []
     report_text = None
+    color_materials = {}
+    created_materials = []
 
     try:
         context.scene.collection.children.link(collection)
@@ -199,13 +233,13 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
             name, points, faces, normals = prepare_meshes(
                 {"units": payload.get("units"), "meshes": [item]}, scale,
             )[0]
-            # Find this body's bounding-box center in scene coordinates.
-            center = tuple(
-                (
-                    min(point[axis] for point in points)
-                    + max(point[axis] for point in points)
-                ) * 0.5
-                for axis in range(3)
+            # For older flat manifests points are already world-positioned.
+            # CAD keeps their original origin; Center changes only the origin.
+            center = (
+                tuple((min(point[axis] for point in points)
+                       + max(point[axis] for point in points)) * 0.5
+                      for axis in range(3))
+                if origin_mode == "CENTER" else (0.0, 0.0, 0.0)
             )
 
             # Store vertices relative to the new object origin.
@@ -233,10 +267,20 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
             obj = bpy.data.objects.new(name, mesh)
             objects.append(obj)
 
-            # Rotate the local geometry and its assembly placement together.
-            # A location-only rotation would scatter parts around the model.
-            obj.location = rotate_position_x(center, rotation_x_deg)
-            obj.rotation_euler.x = math.radians(rotation_x_deg)
+            if use_step_colors:
+                color = item.get("color")
+                if color is None and color_uncolored_parts:
+                    color = generated_part_color(index)
+                if color is not None:
+                    mesh.materials.append(step_color_material(
+                        color, color_materials, created_materials))
+
+            # Keep the STEP axes and the original body placement.
+            if up_rotation is None:
+                obj.location = center
+            else:
+                from mathutils import Matrix, Vector
+                obj.matrix_world = up_rotation @ Matrix.Translation(Vector(center))
 
             assembly_id = item.get("assembly_id", 0)
             target_collection = collections.get(assembly_id)
@@ -245,6 +289,8 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
             target_collection.objects.link(obj)
             obj["step_source"] = str(source)
             obj["step_assembly_id"] = assembly_id
+            obj["step_origin_mode"] = origin_mode
+            obj["step_source_up_axis"] = source_up_axis
             repair = item.get("repair")
             fallback_info = item.get("fallback")
             obj["step_mesher"] = "OCCT" if fallback_info else "NVIDIA"
@@ -314,6 +360,10 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
             if mesh.users == 0:
                 bpy.data.meshes.remove(mesh)
 
+        for material in created_materials:
+            if material.users == 0:
+                bpy.data.materials.remove(material)
+
         for created in reversed(created_collections):
             bpy.data.collections.remove(created)
         raise
@@ -328,10 +378,188 @@ def create_objects_iter(context, payload, source, use_normals, rotation_x_deg=-9
     return len(objects)
 
 
-def create_objects(context, payload, source, use_normals, rotation_x_deg=-90.0):
+def source_up_rotation(source_up_axis):
+    """Rotate source coordinates into Blender Z-up without mirroring them."""
+    from mathutils import Matrix
+
+    if source_up_axis == "Z":
+        return Matrix.Identity(4)
+    if source_up_axis == "Y":
+        return Matrix.Rotation(math.pi / 2, 4, "X")
+    if source_up_axis == "X":
+        return Matrix.Rotation(-math.pi / 2, 4, "Y")
+    raise ValueError("Unknown source up axis.")
+
+
+def create_instances_iter(context, payload, source, use_normals,
+                          origin_mode="CENTER", share_meshes=True,
+                          source_up_axis="Z", use_step_colors=True,
+                          color_uncolored_parts=False):
+    """Convert each prototype once, optionally copy its Blender mesh per instance."""
+    from mathutils import Matrix, Vector
+
+    if origin_mode not in {"CENTER", "CAD"}:
+        raise ValueError("Unknown object origin mode.")
+    up_rotation = source_up_rotation(source_up_axis)
+    if payload.get("units") != "mm" or not payload.get("instances"):
+        raise ValueError("Missing prototype instances or invalid units.")
+    scene_scale = context.scene.unit_settings.scale_length
+    if not math.isfinite(scene_scale) or scene_scale <= 0:
+        raise ValueError("Invalid Blender scene unit scale.")
+    unit_scale = 0.001 / scene_scale
+    definitions = {}
+    for item in payload["meshes"]:
+        identifier = item.get("prototype_id")
+        if type(identifier) is not int or identifier <= 0 or identifier in definitions:
+            raise ValueError("Duplicate or invalid prototype mesh.")
+        definitions[identifier] = item
+
+    collection = bpy.data.collections.new(source.stem)
+    collections = {0: collection}
+    created_collections = [collection]
+    created_meshes = []
+    created_materials = []
+    color_materials = {}
+    colored_prototypes = (
+        {inst["prototype_id"] for inst in payload["instances"]
+         if color_uncolored_parts or inst.get("color") is not None}
+        if use_step_colors else set()
+    )
+    objects = []
+    report_text = None
+    try:
+        context.scene.collection.children.link(collection)
+        collection["step_manifest_version"] = 4
+        for node in payload.get("assemblies", []):
+            parent = collections.get(node["parent_id"])
+            if parent is None or node["id"] in collections:
+                raise ValueError("Invalid assembly hierarchy.")
+            child = bpy.data.collections.new(node["name"])
+            created_collections.append(child)
+            parent.children.link(child)
+            child["step_assembly_id"] = node["id"]
+            collections[node["id"]] = child
+
+        cached = {}
+        used_prototypes = set()
+        available = sum(inst["prototype_id"] in definitions for inst in payload["instances"])
+        for inst in payload["instances"]:
+            identifier = inst["prototype_id"]
+            if identifier not in definitions:
+                continue  # Failed prototype; recorded for every skipped occurrence.
+            if identifier not in cached:
+                item = definitions[identifier]
+                name, points, faces, normals = prepare_meshes(
+                    {"units": "mm", "meshes": [item]}, scene_scale)[0]
+                center = Vector(
+                    tuple((min(p[axis] for p in points)
+                           + max(p[axis] for p in points)) / 2
+                          for axis in range(3))
+                    if origin_mode == "CENTER" else (0.0, 0.0, 0.0)
+                )
+                local = [tuple(Vector(p) - center) for p in points]
+                mesh = bpy.data.meshes.new(name)
+                created_meshes.append(mesh)
+                mesh.from_pydata(local, [], faces)
+                mesh.update()
+                if identifier in colored_prototypes:
+                    # A material slot on the mesh allows per-object material
+                    # overrides even when instances share the same geometry.
+                    mesh.materials.append(step_color_material(
+                        (0.8, 0.8, 0.8, 1.0), color_materials,
+                        created_materials))
+                if use_normals:
+                    for polygon in mesh.polygons:
+                        polygon.use_smooth = True
+                    mesh.normals_split_custom_set(normals)
+                cached[identifier] = (mesh, center)
+            mesh, center = cached[identifier]
+            if not share_meshes and identifier in used_prototypes:
+                mesh = mesh.copy()
+                created_meshes.append(mesh)
+            used_prototypes.add(identifier)
+            values = inst["transform"]
+            if (len(values) != 16 or not all(math.isfinite(v) for v in values)
+                    or list(values[12:]) != [0, 0, 0, 1]):
+                raise ValueError("Invalid placement transform.")
+            matrix_rows = [list(values[i:i + 4]) for i in range(0, 16, 4)]
+            for row in range(3):
+                matrix_rows[row][3] *= unit_scale
+            target = collections.get(inst["assembly_id"])
+            if target is None:
+                raise ValueError("Missing assembly for instance.")
+            obj = bpy.data.objects.new(inst["name"], mesh)
+            objects.append(obj)
+            target.objects.link(obj)
+            obj.matrix_world = up_rotation @ Matrix(matrix_rows) @ Matrix.Translation(center)
+            if identifier in colored_prototypes:
+                slot = obj.material_slots[0]
+                slot.link = "OBJECT"
+                color = inst.get("color")
+                if color is None and color_uncolored_parts:
+                    color = generated_part_color(identifier)
+                if color is not None:
+                    slot.material = step_color_material(
+                        color, color_materials, created_materials)
+                else:
+                    slot.material = color_materials[(0.8, 0.8, 0.8, 1.0)]
+            obj["step_source"] = str(source)
+            obj["step_assembly_id"] = inst["assembly_id"]
+            obj["step_prototype_id"] = identifier
+            obj["step_origin_mode"] = origin_mode
+            obj["step_source_up_axis"] = source_up_axis
+            obj["step_shared_mesh"] = bool(share_meshes)
+            item = definitions[identifier]
+            obj["step_mesher"] = "OCCT" if item.get("fallback") else "NVIDIA"
+            obj["step_repaired"] = bool(item.get("repair"))
+            yield len(objects), available, inst["name"]
+
+        skipped = payload.get("failed_parts", [])
+        recovered = [inst for inst in payload["instances"]
+                     if definitions.get(inst["prototype_id"], {}).get("fallback")]
+        repaired = [inst for inst in payload["instances"]
+                    if definitions.get(inst["prototype_id"], {}).get("repair")]
+        if skipped or recovered or repaired:
+            report_text = bpy.data.texts.new("SimpleStep Import Report")
+            report_text.write(
+                f"SIMPLESTEP IMPORT REPORT\nSource: {source}\n"
+                f"Imported objects: {len(objects)}; unique meshes: {len(cached)}\n"
+                f"Skipped occurrences: {len(skipped)}; OCCT fallback occurrences: {len(recovered)}; "
+                f"repaired occurrences: {len(repaired)}\n\n"
+                + json.dumps({"skipped": skipped, "fallback": recovered,
+                              "repaired": repaired}, ensure_ascii=False, indent=2))
+            collection["step_import_report"] = report_text.name
+            collection["step_skipped_count"] = len(skipped)
+            collection["step_partial_import"] = bool(skipped)
+    except BaseException:
+        if report_text is not None:
+            bpy.data.texts.remove(report_text)
+        for obj in objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        for mesh in created_meshes:
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        for material in created_materials:
+            if material.users == 0:
+                bpy.data.materials.remove(material)
+        for created in reversed(created_collections):
+            bpy.data.collections.remove(created)
+        raise
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for obj in objects:
+        obj.select_set(True)
+    context.view_layer.objects.active = objects[0]
+    return len(objects)
+
+
+def create_objects(context, payload, source, use_normals,
+                   origin_mode="CENTER", share_meshes=True, source_up_axis="Z",
+                   use_step_colors=True, color_uncolored_parts=False):
     """Synchronous wrapper retained for tests and scripts."""
     iterator = create_objects_iter(
-        context, payload, source, use_normals, rotation_x_deg,
+        context, payload, source, use_normals, origin_mode, share_meshes,
+        source_up_axis, use_step_colors, color_uncolored_parts,
     )
     while True:
         try:
@@ -369,11 +597,11 @@ def draw_import_progress():
     if not isinstance(ui_scale, (int, float)) or not math.isfinite(ui_scale):
         ui_scale = 1.0
     ui_scale = min(2.0, max(1.0, ui_scale))
-    title_size = round(32 * ui_scale)
-    detail_size = round(24 * ui_scale)
-    row_height = round(42 * ui_scale)
-    margin = round(36 * ui_scale)
-    left_margin = round(24 * ui_scale)
+    title_size = round(16 * ui_scale)
+    detail_size = round(12 * ui_scale)
+    row_height = round(21 * ui_scale)
+    margin = round(18 * ui_scale)
+    left_margin = round(12 * ui_scale)
     blf.color(font, 1.0, 1.0, 1.0, 1.0)
     blf.enable(font, blf.SHADOW)
     blf.shadow(font, 5, 0.0, 0.0, 0.0, 1.0)
@@ -538,8 +766,9 @@ class StepImportEngine:
             self._wm = context.window_manager
             self._workspace = context.workspace
             self._phase = "worker"
-            self._wm.progress_begin(0, 100)
-            self._progress_active = True
+            # The viewport and status bar already show progress. Blender's
+            # progress API adds an unwanted percentage beside the pointer.
+            self._progress_active = False
             self._progress_message = "Starting geometry worker..."
 
             self._timer = self._wm.event_timer_add(
@@ -574,8 +803,6 @@ class StepImportEngine:
         self._progress_message = message
         if self._workspace is not None:
             self._workspace.status_text_set(f"SimpleStep importer: {message} | Esc to cancel")
-        if fraction is not None and self._progress_active:
-            self._wm.progress_update(max(0.0, min(1.0, fraction)) * 100)
         self.redraw()
 
     def read_worker_progress(self):
@@ -595,17 +822,23 @@ class StepImportEngine:
         self.update_progress(message, completed / total if total else None)
 
     def finish_import(self, count):
-        repaired = sum(bool(item.get("repair")) for item in self._payload["meshes"])
+        result_items = self._payload["meshes"]
+        if self._payload.get("manifest_version") == 4:
+            by_id = {item["prototype_id"]: item for item in result_items}
+            result_items = [by_id[inst["prototype_id"]]
+                            for inst in self._payload["instances"]
+                            if inst["prototype_id"] in by_id]
+        repaired = sum(bool(item.get("repair")) for item in result_items)
         non_manifold = sum(
             bool((item.get("repair") or {}).get("accepted_non_manifold"))
-            for item in self._payload["meshes"]
+            for item in result_items
         )
         skipped = len(self._payload.get("failed_parts", []))
-        fallback_count = sum(bool(item.get("fallback")) for item in self._payload["meshes"])
+        fallback_count = sum(bool(item.get("fallback")) for item in result_items)
         coarser_count = sum(bool((item.get("fallback") or {}).get("coarser_retry"))
-                            for item in self._payload["meshes"])
+                            for item in result_items)
         finer_count = sum(bool((item.get("fallback") or {}).get("finer_retry"))
-                          for item in self._payload["meshes"])
+                          for item in result_items)
         title = f"SimpleStep importer — {self._source.name}"
         log_timings = read_worker_timings(self._log_path)
         timings = dict(log_timings or self._payload.get("timings") or {})
@@ -645,13 +878,9 @@ class StepImportEngine:
                 f"Skipped: {skipped} | Repaired: {repaired} "
                 f"({non_manifold} non-manifold)",
                 time_line,
-                "Details: Text Editor > SimpleStep Import Report",
-                f"Timing: Text Editor > {report.name}",
             )
         else:
-            lines = [title, f"Import complete: {count} mesh object(s)", time_line]
-            lines.append(f"Timing: Text Editor > {report.name}")
-            show_viewport_notice(*lines)
+            show_viewport_notice(title, f"Import complete: {count} mesh object(s)", time_line)
         return {"FINISHED"}
 
     def modal(self, context, event):
@@ -697,12 +926,14 @@ class StepImportEngine:
                     raise RuntimeError("Return to Object Mode and retry.")
                 self._creator = create_objects_iter(
                     context, self._payload, self._source, self.use_normals,
-                    self.rotation_x_deg,
+                    self.origin_mode, self.share_meshes, self.source_up_axis,
+                    self.use_step_colors, self.color_uncolored_parts,
                 )
                 self._creating_started = time.monotonic()
                 self._phase = "creating"
+                object_total = len(self._payload.get("instances") or self._payload["meshes"])
                 self.update_progress(
-                    f"Creating Blender objects: 0/{len(self._payload['meshes'])}", 0,
+                    f"Creating Blender objects: 0/{object_total}", 0,
                 )
                 return {"RUNNING_MODAL"}
 
@@ -759,12 +990,7 @@ class StepImportEngine:
         if process is not None and process.poll() is None:
             try:
                 subprocess.run(
-                    [
-                        "taskkill",
-                        "/PID", str(process.pid),
-                        "/T",
-                        "/F",
-                    ],
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
