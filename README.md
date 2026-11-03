@@ -1,4 +1,4 @@
-```markdown
+ 
 # SimpleStep Importer
 
 Import STEP (`.step`, `.stp`) CAD files into Blender as clean 3D meshes. SimpleStep keeps your part names, assembly hierarchy, repeated parts (instances), and CAD colors without freezing Blender.
