@@ -95,4 +95,3 @@ Compress-Archive -Path ".\step_importer" -DestinationPath ".\dist\SimpleStep-imp
 ```
 
 Test the generated archive in Blender before tagging a release. Keep all license notices inside the `runtime` directory.
-```
